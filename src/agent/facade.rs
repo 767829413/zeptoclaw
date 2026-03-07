@@ -244,6 +244,7 @@ pub struct ZeptoAgentBuilder {
     system_prompt: Option<String>,
     max_iterations: usize,
     model: Option<String>,
+    history: Vec<Message>,
 }
 
 impl ZeptoAgentBuilder {
@@ -255,6 +256,7 @@ impl ZeptoAgentBuilder {
             system_prompt: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             model: None,
+            history: Vec::new(),
         }
     }
 
@@ -300,6 +302,14 @@ impl ZeptoAgentBuilder {
         self
     }
 
+    /// Pre-load conversation history (e.g. restored from a previous session).
+    ///
+    /// The agent will continue the conversation from where it left off.
+    pub fn with_history(mut self, history: Vec<Message>) -> Self {
+        self.history = history;
+        self
+    }
+
     /// Build the `ZeptoAgent`.
     ///
     /// Returns `Err` if no provider was set.
@@ -319,7 +329,7 @@ impl ZeptoAgentBuilder {
             tools: self.tools,
             system_prompt,
             max_iterations: self.max_iterations,
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(self.history),
             model: self.model,
         })
     }
