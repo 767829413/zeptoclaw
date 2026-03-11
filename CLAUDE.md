@@ -741,6 +741,32 @@ cargo nextest run --no-capture
 cargo test --lib -- --test-threads=1
 ```
 
+### Manual Stabilization Smoke
+
+Use this checklist when the goal is to stabilize the product rather than add surface area.
+The minimum path that must work is:
+
+```bash
+./target/release/zeptoclaw config check
+./target/release/zeptoclaw provider status
+./target/release/zeptoclaw agent -m "Hello"
+```
+
+Priority manual checks:
+
+1. Fresh install path: build, `--help`, `version`, first run without panic
+2. Config path: `config check` handles missing, invalid, and valid config clearly
+3. Provider path: `provider status` shows one usable provider or a specific failure reason
+4. Core agent path: `agent -m "Hello"` returns a response on repeated runs
+5. Streaming path: `agent --stream -m "Hello"` streams and exits cleanly
+6. Interactive path: `agent` accepts input and exits with `quit`
+7. Error path: missing API key or bad model fails cleanly with actionable stderr
+8. Tool safety path: `agent --dry-run -m "..."` works and tool failure does not crash the process
+9. Batch path: a tiny `batch --input prompts.txt` run succeeds and reports failures clearly
+10. Persistence path: history and memory commands do not panic on empty state
+
+Turn any panic, hang, misleading success, inconsistent repeated run, or broken documented command into a GitHub issue.
+
 ## Benchmarks
 
 Verified on Apple Silicon (release build):
