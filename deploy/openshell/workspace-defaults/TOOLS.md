@@ -2,43 +2,74 @@
 
 ## Xiaohongshu (小红书) — via MCP
 
-The `xiaohongshu` MCP server provides tools for interacting with Xiaohongshu.
+All Xiaohongshu tools are prefixed with `xiaohongshu_` and called as regular tool calls.
 
-### Available MCP Tools
+### Available Tools
 
-| Tool | Description |
-|------|-------------|
-| `get_qr_code` | Get login QR code — returns base64 image |
-| `check_login_status` | Check if QR code has been scanned |
-| `search_notes` | Search notes by keyword |
-| `get_note_detail` | Get full note content by URL |
-| `publish_image_note` | Publish an image note |
-| `publish_video_note` | Publish a video note |
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `xiaohongshu_check_login_status` | (none) | Check login status |
+| `xiaohongshu_get_login_qrcode` | (none) | Get QR code for login |
+| `xiaohongshu_set_cookies` | `cookies` | Import cookies JSON to log in |
+| `xiaohongshu_get_cookies` | (none) | Export current cookies |
+| `xiaohongshu_delete_cookies` | (none) | Clear cookies, reset login |
+| `xiaohongshu_my_profile` | (none) | Get current user's profile and posts |
+| `xiaohongshu_list_feeds` | (none) | Get homepage feed (other people's posts) |
+| `xiaohongshu_search_feeds` | `keyword`, `filters` | Search posts |
+| `xiaohongshu_get_feed_detail` | `feed_id`, `xsec_token` | Get post details and comments |
+| `xiaohongshu_user_profile` | `user_id`, `xsec_token` | Get any user's profile |
+| `xiaohongshu_publish_content` | `title`, `content`, `images`, `tags` | Publish image post |
+| `xiaohongshu_publish_with_video` | `title`, `content`, `video`, `tags` | Publish video post |
+| `xiaohongshu_post_comment_to_feed` | `feed_id`, `xsec_token`, `content` | Comment on a post |
+| `xiaohongshu_reply_comment_in_feed` | `feed_id`, `xsec_token`, `comment_id`/`user_id`, `content` | Reply to a comment |
+| `xiaohongshu_like_feed` | `feed_id`, `xsec_token` | Like/unlike a post |
+| `xiaohongshu_favorite_feed` | `feed_id`, `xsec_token` | Favorite/unfavorite a post |
 
 ### Login Flow
 
-1. Call `get_qr_code` → sends QR image
-2. User scans with Xiaohongshu app
-3. Poll `check_login_status` until success
-4. Cookies are persisted — login survives restarts
+Before any operation, check login:
+1. Call `xiaohongshu_check_login_status`
+2. If logged in, proceed directly
+3. If not, ask the user to provide cookies or use QR login
 
-### Publishing Notes
+### Understanding xsec_token
 
-Images must be **HTTPS URLs** (e.g. `https://images.unsplash.com/photo-xxx`).
-The MCP server downloads them automatically. Do not use local file paths.
+Many tools require `xsec_token`. This is an anti-bot security token from Xiaohongshu, NOT a login credential. Key facts:
+- **Where to get it**: from `xiaohongshu_list_feeds` or `xiaohongshu_search_feeds` — each feed item contains an `xsecToken` field
+- **Any valid token works**: you can reuse a token from any feed result for other API calls
+- **It is NOT tied to a specific post** — grab one from any feed list and use it everywhere
 
-```json
-{
-  "title": "标题",
-  "content": "正文内容\n\n#标签1 #标签2",
-  "images": ["https://example.com/photo1.jpg", "https://example.com/photo2.jpg"]
-}
-```
+### Viewing My Own Posts
 
-### Error Handling
+Use `xiaohongshu_my_profile` — it requires NO parameters and returns the current logged-in user's profile info and post list.
 
-| Error | Action |
-|-------|--------|
-| Login expired | Re-run login flow |
-| Image download failed | Verify URL is accessible, retry |
-| Publish timeout | Wait 30s, retry once |
+Do NOT use `xiaohongshu_list_feeds` for this — that returns the homepage recommendation feed (other people's posts).
+
+### Viewing Another User's Posts
+
+1. Call `xiaohongshu_list_feeds` to get a feed list (grab any `xsecToken` from the results)
+2. Call `xiaohongshu_user_profile` with `user_id` + `xsec_token`
+
+### Replying to Comments — Standard Workflow
+
+There is no "notification inbox" API. To reply to comments on your posts, follow these steps:
+
+**Step 1**: Call `xiaohongshu_my_profile` to get your posts. Each post has `feed_id` and `xsecToken`.
+
+**Step 2**: For each post, call `xiaohongshu_get_feed_detail` with `feed_id` and `xsec_token` to get its comments. The response contains `comments.list[]` where each comment has:
+- `id` → use as `comment_id`
+- `userInfo.userId` → use as `user_id`
+
+**Step 3**: Call `xiaohongshu_reply_comment_in_feed` with `feed_id`, `xsec_token`, `comment_id`, `user_id`, and `content`.
+
+Process posts **one at a time** (not in parallel) to avoid Chrome resource exhaustion.
+
+### Publishing
+
+Images must be **HTTPS URLs**. The MCP server downloads them internally. Never use local file paths.
+
+Title max 20 characters, content max 1000 characters. Add tags for better reach.
+
+### Cookie Expiration
+
+When any tool returns an error containing "Cookie 已过期", tell the user their cookies have expired and ask them to provide new cookies from their browser.

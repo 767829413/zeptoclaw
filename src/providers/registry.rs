@@ -432,12 +432,18 @@ pub fn resolve_runtime_providers(config: &Config) -> Vec<RuntimeProviderSelectio
         });
         let api_base = user_base.or_else(|| spec.default_base_url.map(String::from));
 
-        let effective_auth_header = provider
-            .and_then(|p| p.auth_header.as_deref())
-            .map(str::trim)
-            .filter(|h| !h.is_empty())
-            .map(|h| h.to_string())
-            .or_else(|| spec.default_auth_header.map(String::from));
+        let effective_auth_header = {
+            let user_val = provider
+                .and_then(|p| p.auth_header.as_deref())
+                .map(str::trim);
+            match user_val {
+                // "bearer" sentinel: explicitly use standard Authorization: Bearer header,
+                // overriding provider spec defaults (e.g. Azure's "api-key").
+                Some(h) if h.eq_ignore_ascii_case("bearer") => None,
+                Some(h) if !h.is_empty() => Some(h.to_string()),
+                _ => spec.default_auth_header.map(String::from),
+            }
+        };
 
         let effective_api_version = provider
             .and_then(|p| p.api_version.as_deref())
@@ -1005,6 +1011,40 @@ mod tests {
         assert_eq!(selected.name, "azure");
         // Empty string should fall through to spec default
         assert_eq!(selected.auth_header.as_deref(), Some("api-key"));
+    }
+
+    #[test]
+    fn test_bearer_sentinel_overrides_azure_default_auth_header() {
+        let mut config = Config::default();
+        config.providers.azure = Some(ProviderConfig {
+            api_key: Some("my-entra-token".to_string()),
+            api_base: Some(
+                "https://myco.openai.azure.com/openai/deployments/gpt-4o".to_string(),
+            ),
+            auth_header: Some("bearer".to_string()),
+            ..Default::default()
+        });
+
+        let selected = resolve_runtime_provider(&config).expect("should resolve");
+        assert_eq!(selected.name, "azure");
+        // "bearer" sentinel → None → OpenAIProvider uses Authorization: Bearer
+        assert!(selected.auth_header.is_none());
+    }
+
+    #[test]
+    fn test_bearer_sentinel_case_insensitive() {
+        let mut config = Config::default();
+        config.providers.azure = Some(ProviderConfig {
+            api_key: Some("my-entra-token".to_string()),
+            api_base: Some(
+                "https://myco.openai.azure.com/openai/deployments/gpt-4o".to_string(),
+            ),
+            auth_header: Some("Bearer".to_string()),
+            ..Default::default()
+        });
+
+        let selected = resolve_runtime_provider(&config).expect("should resolve");
+        assert!(selected.auth_header.is_none());
     }
 
     #[test]

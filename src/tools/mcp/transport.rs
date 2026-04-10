@@ -16,6 +16,13 @@ pub trait McpTransport: Send + Sync {
     /// Send a JSON-RPC request and return the response.
     async fn send(&self, request: &McpRequest) -> Result<McpResponse, String>;
 
+    /// Send a JSON-RPC notification (no `id`, no response expected).
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), String>;
+
     /// Gracefully shut down the transport (kill child process, close connection, etc.).
     async fn shutdown(&self) -> Result<(), String>;
 
@@ -23,10 +30,22 @@ pub trait McpTransport: Send + Sync {
     fn transport_type(&self) -> &str;
 }
 
+/// Build a JSON-RPC 2.0 notification (no `id` field).
+fn build_notification(method: &str, params: Option<serde_json::Value>) -> serde_json::Value {
+    match params {
+        Some(p) => serde_json::json!({"jsonrpc": "2.0", "method": method, "params": p}),
+        None => serde_json::json!({"jsonrpc": "2.0", "method": method}),
+    }
+}
+
 /// HTTP transport for MCP — sends JSON-RPC requests via POST.
+///
+/// Supports Streamable HTTP transport: captures `Mcp-Session-Id` from server
+/// responses and includes it in all subsequent requests.
 pub struct HttpTransport {
     url: String,
     http: reqwest::Client,
+    session_id: tokio::sync::RwLock<Option<String>>,
 }
 
 impl HttpTransport {
@@ -39,6 +58,7 @@ impl HttpTransport {
         Self {
             url: url.to_string(),
             http,
+            session_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -46,20 +66,46 @@ impl HttpTransport {
     pub fn url(&self) -> &str {
         &self.url
     }
+
+    fn build_post(&self, session_id: &Option<String>) -> reqwest::RequestBuilder {
+        let mut req = self.http.post(&self.url);
+        if let Some(ref sid) = *session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        req
+    }
+
+    async fn capture_session_id(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(val) = headers.get("mcp-session-id") {
+            if let Ok(s) = val.to_str() {
+                let mut sid = self.session_id.write().await;
+                *sid = Some(s.to_string());
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl McpTransport for HttpTransport {
     async fn send(&self, request: &McpRequest) -> Result<McpResponse, String> {
+        let sid = self.session_id.read().await.clone();
         let resp = self
-            .http
-            .post(&self.url)
+            .build_post(&sid)
             .json(request)
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {}", e))?;
 
         let status = resp.status();
+        self.capture_session_id(resp.headers()).await;
+
+        if status == reqwest::StatusCode::NOT_FOUND && sid.is_some() {
+            let mut s = self.session_id.write().await;
+            *s = None;
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("MCP_SESSION_EXPIRED: {}", body));
+        }
+
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("HTTP {} from MCP server: {}", status, body));
@@ -68,6 +114,30 @@ impl McpTransport for HttpTransport {
         resp.json::<McpResponse>()
             .await
             .map_err(|e| format!("Failed to parse MCP response: {}", e))
+    }
+
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let body = build_notification(method, params);
+        let sid = self.session_id.read().await.clone();
+        let resp = self
+            .build_post(&sid)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP notification failed: {}", e))?;
+
+        self.capture_session_id(resp.headers()).await;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("HTTP {} from MCP notification: {}", status, body));
+        }
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), String> {
@@ -180,6 +250,27 @@ impl McpTransport for StdioTransport {
 
         serde_json::from_slice::<McpResponse>(&buf)
             .map_err(|e| format!("Failed to parse MCP stdio response: {}", e))
+    }
+
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let body = serde_json::to_string(&build_notification(method, params))
+            .map_err(|e| format!("Failed to serialize notification: {}", e))?;
+        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let timeout = std::time::Duration::from_secs(self.timeout_secs);
+        let mut io = self.io.lock().await;
+        tokio::time::timeout(timeout, io.stdin.write_all(frame.as_bytes()))
+            .await
+            .map_err(|_| "Timeout writing notification to MCP server".to_string())?
+            .map_err(|e| format!("Failed to write notification: {}", e))?;
+        tokio::time::timeout(timeout, io.stdin.flush())
+            .await
+            .map_err(|_| "Timeout flushing notification".to_string())?
+            .map_err(|e| format!("Failed to flush notification: {}", e))?;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), String> {

@@ -34,7 +34,7 @@ impl McpToolWrapper {
         Self {
             tool_name: format!("{}_{}", server_name, remote_name),
             description: description.to_string(),
-            input_schema,
+            input_schema: normalize_object_schema(input_schema),
             remote_name: remote_name.to_string(),
             client,
         }
@@ -106,6 +106,19 @@ impl Tool for McpToolWrapper {
             }))
         }
     }
+}
+
+/// Ensure an object schema has `properties` — some MCP servers omit it for
+/// no-parameter tools, but OpenAI/Azure reject schemas without it.
+fn normalize_object_schema(mut schema: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = schema.as_object_mut() {
+        if obj.get("type").and_then(|v| v.as_str()) == Some("object")
+            && !obj.contains_key("properties")
+        {
+            obj.insert("properties".to_string(), serde_json::json!({}));
+        }
+    }
+    schema
 }
 
 #[cfg(test)]

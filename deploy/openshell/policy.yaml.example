@@ -2,6 +2,8 @@
 #
 # Principle: deny all by default, explicitly allow only what zeptoclaw needs.
 # Network policies are hot-reloadable: openshell policy set <name> --policy policy.yaml
+#
+# Copy this file to policy.yaml and fill in your environment-specific values.
 
 version: 1
 
@@ -42,26 +44,26 @@ network_policies:
   # LLM Providers — uncomment the ones you use
   # =====================================================================
 
-  anthropic:
-    name: anthropic
-    endpoints:
-      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
-    binaries:
-      - { path: /usr/local/bin/zeptoclaw }
+  # anthropic:
+  #   name: anthropic
+  #   endpoints:
+  #     - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
 
-  openai:
-    name: openai
-    endpoints:
-      - { host: api.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
-    binaries:
-      - { path: /usr/local/bin/zeptoclaw }
+  # openai:
+  #   name: openai
+  #   endpoints:
+  #     - { host: api.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
 
-  azure_openai:
-    name: azure-openai
-    endpoints:
-      - { host: helios-ai-openai-gpt5-resource.openai.azure.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
-    binaries:
-      - { path: /usr/local/bin/zeptoclaw }
+  # azure_openai:
+  #   name: azure-openai
+  #   endpoints:
+  #     - { host: YOUR_AZURE_RESOURCE.openai.azure.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
 
   # openrouter:
   #   name: openrouter
@@ -107,13 +109,13 @@ network_policies:
   # MCP sidecars
   # =====================================================================
 
-  xiaohongshu_mcp:
-    name: xiaohongshu-mcp
-    endpoints:
-      # 172.17.0.1 = default Docker bridge gateway on Linux
-      - { host: 172.17.0.1, port: 18060 }
-    binaries:
-      - { path: /usr/local/bin/zeptoclaw }
+  # xiaohongshu_mcp:
+  #   name: xiaohongshu-mcp
+  #   endpoints:
+  #     # Docker bridge gateway IP — 172.17.0.1 on Linux, host.docker.internal on macOS
+  #     - { host: 172.17.0.1, port: 18060 }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
 
   # =====================================================================
   # Shell tool — git (read-only by default)

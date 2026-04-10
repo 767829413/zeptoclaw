@@ -70,12 +70,25 @@ impl McpClient {
         self.transport.transport_type()
     }
 
-    /// Send a JSON-RPC request via transport and return the response.
+    /// Send a JSON-RPC request via transport, with automatic session recovery
+    /// for HTTP Streamable transport: if the server returns 404 (session expired),
+    /// re-initialize and retry once.
     async fn send_request(&self, request: &McpRequest) -> Result<McpResponse, String> {
-        self.transport.send(request).await
+        match self.transport.send(request).await {
+            Err(e) if e.starts_with("MCP_SESSION_EXPIRED") => {
+                tracing::warn!(
+                    server = %self.server_name,
+                    "MCP session expired, re-initializing"
+                );
+                self.initialize().await?;
+                self.transport.send(request).await
+            }
+            other => other,
+        }
     }
 
-    /// Send the initialize handshake.
+    /// Send the initialize handshake, then send `notifications/initialized`
+    /// as required by the MCP protocol before any further requests.
     pub async fn initialize(&self) -> Result<serde_json::Value, String> {
         let params = InitializeParams::default();
         let request = McpRequest::new(
@@ -84,12 +97,19 @@ impl McpClient {
             Some(serde_json::to_value(&params).map_err(|e| e.to_string())?),
         );
 
-        let response = self.send_request(&request).await?;
+        let response = self.transport.send(&request).await?;
         if let Some(error) = response.error {
             return Err(format!("MCP initialize error: {}", error.message));
         }
 
-        Ok(response.result.unwrap_or(serde_json::Value::Null))
+        let result = response.result.unwrap_or(serde_json::Value::Null);
+
+        self.transport
+            .send_notification("notifications/initialized", None)
+            .await
+            .map_err(|e| format!("Failed to send initialized notification: {}", e))?;
+
+        Ok(result)
     }
 
     /// List available tools (cached after first call).

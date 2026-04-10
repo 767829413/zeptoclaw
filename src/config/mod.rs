@@ -539,6 +539,12 @@ impl Config {
                 .get_or_insert_with(ProviderConfig::default)
                 .api_version = Some(v);
         }
+        if let Ok(v) = std::env::var("ZEPTOCLAW_PROVIDERS_AZURE_AUTH_HEADER") {
+            self.providers
+                .azure
+                .get_or_insert_with(ProviderConfig::default)
+                .auth_header = Some(v);
+        }
 
         // Amazon Bedrock
         if let Ok(v) = std::env::var("ZEPTOCLAW_PROVIDERS_BEDROCK_API_KEY") {
