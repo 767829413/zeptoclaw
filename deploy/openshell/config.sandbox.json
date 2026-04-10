@@ -1,0 +1,22 @@
+{
+  "providers": {},
+  "channels": {},
+  "runtime": {
+    "runtime_type": "Native",
+    "allow_fallback_to_native": false
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/sandbox/.zeptoclaw/workspace"
+    }
+  },
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "tools": {
+    "shell": {
+      "enabled": true
+    }
+  }
+}

@@ -1,0 +1,164 @@
+# OpenShell sandbox policy for Zeptoclaw Gateway
+#
+# Principle: deny all by default, explicitly allow only what zeptoclaw needs.
+# Network policies are hot-reloadable: openshell policy set <name> --policy policy.yaml
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+
+  # =====================================================================
+  # LLM Providers — uncomment the ones you use
+  # =====================================================================
+
+  anthropic:
+    name: anthropic
+    endpoints:
+      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+
+  openai:
+    name: openai
+    endpoints:
+      - { host: api.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+
+  # azure_openai:
+  #   name: azure-openai
+  #   endpoints:
+  #     # Replace YOUR-RESOURCE with your Azure OpenAI resource name
+  #     - { host: YOUR-RESOURCE.openai.azure.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
+
+  # openrouter:
+  #   name: openrouter
+  #   endpoints:
+  #     - { host: openrouter.ai, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
+
+  # google_gemini:
+  #   name: google-gemini
+  #   endpoints:
+  #     - { host: generativelanguage.googleapis.com, port: 443 }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
+
+  # =====================================================================
+  # Channel APIs
+  # =====================================================================
+
+  discord:
+    name: discord
+    endpoints:
+      - { host: discord.com, port: 443 }
+      - { host: gateway.discord.gg, port: 443 }
+      - { host: cdn.discordapp.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+
+  # telegram:
+  #   name: telegram
+  #   endpoints:
+  #     - { host: api.telegram.org, port: 443 }
+  #   binaries:
+  #     - { path: /usr/local/bin/zeptoclaw }
+
+  # =====================================================================
+  # MCP sidecars
+  # =====================================================================
+
+  xiaohongshu_mcp:
+    name: xiaohongshu-mcp
+    endpoints:
+      # 172.17.0.1 = default Docker bridge gateway on Linux
+      - { host: 172.17.0.1, port: 18060 }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+
+  # =====================================================================
+  # Shell tool — git (read-only by default)
+  # =====================================================================
+
+  github:
+    name: github
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/**/info/refs*"
+          - allow:
+              method: POST
+              path: "/**/git-upload-pack"
+    binaries:
+      - { path: /usr/bin/git }
+
+  github_rest_api:
+    name: github-rest-api
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/**"
+    binaries:
+      - { path: /usr/bin/git }
+      - { path: /usr/bin/gh }
+      - { path: /usr/local/bin/zeptoclaw }
+
+  # =====================================================================
+  # Package managers
+  # =====================================================================
+
+  pypi:
+    name: pypi
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/uv }
+      - { path: "/sandbox/.venv/bin/pip" }
+      - { path: "/sandbox/.venv/bin/python" }
+      - { path: "/sandbox/.venv/bin/python3" }
+      - { path: "/sandbox/.uv/python/**" }
+
+  npm_registry:
+    name: npm-registry
+    endpoints:
+      - { host: registry.npmjs.org, port: 443 }
+    binaries:
+      - { path: /usr/bin/node }
+      - { path: /usr/local/bin/npm }

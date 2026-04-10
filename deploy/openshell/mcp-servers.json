@@ -1,0 +1,9 @@
+{
+  "servers": [
+    {
+      "name": "xiaohongshu",
+      "url": "http://172.17.0.1:18060/mcp",
+      "timeout_secs": 120
+    }
+  ]
+}
