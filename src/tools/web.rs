@@ -1310,6 +1310,12 @@ pub fn is_blocked_host(url: &Url) -> bool {
 /// Returns the first safe resolved IP address so the caller can pin the
 /// connection to it, preventing DNS rebinding attacks where a second DNS
 /// lookup (by the HTTP client) returns a different, private IP.
+///
+/// When running behind an HTTP(S) proxy (detected via `HTTPS_PROXY` or
+/// `HTTP_PROXY` env vars), DNS resolution is handled by the proxy and may
+/// not be available locally.  In that case, a DNS failure is not fatal: the
+/// function logs a warning and returns `Ok(None)`, deferring access control
+/// to the proxy/network policy layer.
 pub async fn resolve_and_check_host(url: &Url) -> Result<Option<(String, std::net::SocketAddr)>> {
     let host = url
         .host_str()
@@ -1323,10 +1329,23 @@ pub async fn resolve_and_check_host(url: &Url) -> Result<Option<(String, std::ne
     let port = url.port_or_known_default().unwrap_or(443);
     let lookup_addr = format!("{}:{}", host, port);
 
-    let addrs: Vec<std::net::SocketAddr> = lookup_host(&lookup_addr)
-        .await
-        .map_err(|e| ZeptoError::Tool(format!("DNS lookup failed for '{}': {}", host, e)))?
-        .collect();
+    let addrs: Vec<std::net::SocketAddr> = match lookup_host(&lookup_addr).await {
+        Ok(iter) => iter.collect(),
+        Err(e) => {
+            if has_http_proxy() {
+                tracing::warn!(
+                    host = %host,
+                    "DNS lookup failed behind proxy, deferring SSRF check to proxy: {}",
+                    e
+                );
+                return Ok(None);
+            }
+            return Err(ZeptoError::Tool(format!(
+                "DNS lookup failed for '{}': {}",
+                host, e
+            )));
+        }
+    };
 
     for addr in &addrs {
         if is_private_or_local_ip(addr.ip()) {
@@ -1344,6 +1363,16 @@ pub async fn resolve_and_check_host(url: &Url) -> Result<Option<(String, std::ne
         .into_iter()
         .next()
         .map(|addr| (host.to_string(), addr)))
+}
+
+/// Check whether the process is running behind an HTTP(S) proxy.
+fn has_http_proxy() -> bool {
+    std::env::var_os("HTTPS_PROXY")
+        .or_else(|| std::env::var_os("https_proxy"))
+        .or_else(|| std::env::var_os("HTTP_PROXY"))
+        .or_else(|| std::env::var_os("http_proxy"))
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 fn is_private_or_local_ip(ip: IpAddr) -> bool {

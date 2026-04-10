@@ -116,6 +116,89 @@ network_policies:
       - { path: /usr/local/bin/zeptoclaw }
 
   # =====================================================================
+  # Web access — search engines and common web domains
+  # OpenShell rejects bare `host: "*"`, so we enumerate TLD-level patterns.
+  # =====================================================================
+
+  web_search:
+    name: web-search
+    endpoints:
+      - { host: "*.duckduckgo.com", port: 443, tls: terminate }
+      - { host: "*.brave.com", port: 443, tls: terminate }
+      - { host: "*.search.brave.com", port: 443, tls: terminate }
+      - { host: "*.searxng.com", port: 443, tls: terminate }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+
+  web_fetch_l1:
+    name: web-fetch-l1
+    endpoints:
+      - { host: "*.com", port: 443, tls: terminate }
+      - { host: "*.org", port: 443, tls: terminate }
+      - { host: "*.net", port: 443, tls: terminate }
+      - { host: "*.io", port: 443, tls: terminate }
+      - { host: "*.dev", port: 443, tls: terminate }
+      - { host: "*.li", port: 443, tls: terminate }
+      - { host: "*.cn", port: 443, tls: terminate }
+      - { host: "*.me", port: 443, tls: terminate }
+      - { host: "*.cc", port: 443, tls: terminate }
+      - { host: "*.co", port: 443, tls: terminate }
+      - { host: "*.info", port: 443, tls: terminate }
+      - { host: "*.app", port: 443, tls: terminate }
+      - { host: "*.xyz", port: 443, tls: terminate }
+      - { host: "*.com", port: 80 }
+      - { host: "*.org", port: 80 }
+      - { host: "*.net", port: 80 }
+      - { host: "*.io", port: 80 }
+      - { host: "*.li", port: 80 }
+      - { host: "*.cn", port: 80 }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+
+  web_fetch_l2:
+    name: web-fetch-l2
+    endpoints:
+      - { host: "*.*.com", port: 443, tls: terminate }
+      - { host: "*.*.org", port: 443, tls: terminate }
+      - { host: "*.*.net", port: 443, tls: terminate }
+      - { host: "*.*.io", port: 443, tls: terminate }
+      - { host: "*.*.dev", port: 443, tls: terminate }
+      - { host: "*.*.li", port: 443, tls: terminate }
+      - { host: "*.*.cn", port: 443, tls: terminate }
+      - { host: "*.*.me", port: 443, tls: terminate }
+      - { host: "*.*.cc", port: 443, tls: terminate }
+      - { host: "*.*.co", port: 443, tls: terminate }
+      - { host: "*.*.info", port: 443, tls: terminate }
+      - { host: "*.*.app", port: 443, tls: terminate }
+      - { host: "*.*.xyz", port: 443, tls: terminate }
+      - { host: "*.*.com", port: 80 }
+      - { host: "*.*.org", port: 80 }
+      - { host: "*.*.net", port: 80 }
+      - { host: "*.*.io", port: 80 }
+      - { host: "*.*.li", port: 80 }
+      - { host: "*.*.cn", port: 80 }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+
+  web_fetch_l3:
+    name: web-fetch-l3
+    endpoints:
+      - { host: "*.*.*.com", port: 443, tls: terminate }
+      - { host: "*.*.*.org", port: 443, tls: terminate }
+      - { host: "*.*.*.net", port: 443, tls: terminate }
+      - { host: "*.*.*.io", port: 443, tls: terminate }
+      - { host: "*.*.*.cn", port: 443, tls: terminate }
+      - { host: "*.*.*.co", port: 443, tls: terminate }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+
+  # =====================================================================
   # Shell tool — git (read-only by default)
   # =====================================================================
 
