@@ -361,7 +361,7 @@ ZeptoClaw is a pure open-source software project. It has no token, no cryptocurr
   <em>ZeptoClaw — Because your AI assistant shouldn't need more RAM than your text editor.</em>
 </p>
 <p align="center">
-  Built by <a href="https://github.com/qhkm">Aisar Labs</a>
+  Built by <a href="https://aisar.ai">Aisar Labs</a>
 </p>
 
 ---
