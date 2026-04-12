@@ -1,5 +1,29 @@
 # Tool Reference
 
+## Web Reading — via Jina Reader (preferred over web_fetch)
+
+When you need to read a webpage, **always use Jina Reader** instead of `web_fetch`. It renders JavaScript server-side and returns clean Markdown — essential for SPAs like Twitter/X, Reddit, etc.
+
+```bash
+curl -sL "https://r.jina.ai/<URL>"
+```
+
+Example:
+```bash
+curl -sL "https://r.jina.ai/https://x.com/someuser/status/123456"
+```
+
+`web_fetch` only does static HTML parsing and **cannot** handle JS-rendered pages. Jina Reader renders the page server-side and extracts the main content as Markdown.
+
+Rules:
+- Use `shell` tool to run `curl -sL "https://r.jina.ai/<URL>"`
+- Put the full target URL after `https://r.jina.ai/` — no encoding needed
+- Free, no API key required
+- If Jina is down or returns an error, fall back to `web_fetch`
+- For search, still use `web_search` tool (not Jina)
+
+---
+
 ## Xiaohongshu (小红书) — via MCP
 
 All Xiaohongshu tools are prefixed with `xiaohongshu_` and called as regular tool calls.

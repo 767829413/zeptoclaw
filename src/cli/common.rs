@@ -304,6 +304,22 @@ pub(crate) async fn create_agent_with_template(
         }
     }
 
+    // Load TOOLS.md from workspace — must come after with_system_prompt() to survive override
+    let tools_path = config.workspace_path().join("TOOLS.md");
+    if tools_path.is_file() {
+        match std::fs::read_to_string(&tools_path) {
+            Ok(content) => {
+                let content = content.trim();
+                if !content.is_empty() {
+                    context_builder =
+                        context_builder.with_system_prompt_suffix(&format!("\n\n{}", content));
+                    info!("Loaded TOOLS.md from {}", tools_path.display());
+                }
+            }
+            Err(e) => warn!("Failed to read TOOLS.md at {}: {}", tools_path.display(), e),
+        }
+    }
+
     // Build runtime context for environment awareness (time, platform, etc.)
     let runtime_ctx = RuntimeContext::new()
         .with_timezone(&config.agents.defaults.timezone)

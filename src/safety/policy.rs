@@ -38,6 +38,15 @@ pub enum PolicyAction {
     Warn,
 }
 
+/// Which scan directions a policy rule applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyScope {
+    /// Only when scanning tool input / LLM-generated commands.
+    InputOnly,
+    /// Both input and output directions.
+    Both,
+}
+
 /// A single policy violation detected by the engine.
 #[derive(Debug, Clone)]
 pub struct PolicyViolation {
@@ -63,6 +72,7 @@ struct CompiledRule {
     severity: PolicySeverity,
     action: PolicyAction,
     description: &'static str,
+    scope: PolicyScope,
     /// Individual compiled regex used to extract the matched text.
     pattern: Regex,
 }
@@ -71,11 +81,23 @@ struct CompiledRule {
 // Rule definitions (pattern source strings)
 // ---------------------------------------------------------------------------
 
-/// `(name, severity, action, description, regex_pattern)`
+/// `(name, severity, action, description, regex_pattern, scope)`
 ///
 /// All patterns are compiled with case-insensitive mode (`(?i)`) so that
 /// trivial case-variation bypasses are ineffective.
-const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
+///
+/// `scope` controls which scan direction a rule applies to:
+/// - `InputOnly` — only tool input (e.g. shell injection patterns that
+///   legitimately appear in tool output such as web page markdown).
+/// - `Both` — input and output.
+const RULE_DEFS: &[(
+    &str,
+    PolicySeverity,
+    PolicyAction,
+    &str,
+    &str,
+    PolicyScope,
+)] = &[
     // 1. System file access
     (
         "system_file_access",
@@ -83,6 +105,7 @@ const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
         PolicyAction::Block,
         "Attempt to access sensitive system files",
         r"(?i)(/etc/passwd|/etc/shadow|\.ssh/|\.aws/credentials|\.gnupg/|\.bashrc|\.profile|\.zshrc)",
+        PolicyScope::Both,
     ),
     // 2. Crypto / private key paths
     (
@@ -91,6 +114,7 @@ const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
         PolicyAction::Block,
         "Reference to private key material",
         r"(?i)(id_rsa|id_ed25519|id_ecdsa|id_dsa|\.pem\b|private[_-]?key|-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY)",
+        PolicyScope::Both,
     ),
     // 3. SQL injection
     (
@@ -99,6 +123,7 @@ const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
         PolicyAction::Sanitize,
         "Potential SQL injection payload",
         r"(?i)(DROP\s+TABLE|DELETE\s+FROM|UNION\s+SELECT|OR\s+1\s*=\s*1|';\s*--)",
+        PolicyScope::InputOnly,
     ),
     // 4. Shell injection
     (
@@ -107,6 +132,7 @@ const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
         PolicyAction::Block,
         "Potential shell injection payload",
         r"(?i)(;\s*rm\s+-rf|&&\s*rm\s|curl\s+.*\|\s*sh|wget\s+.*\|\s*sh|\$\(|`[^`]+`)",
+        PolicyScope::InputOnly,
     ),
     // 5. Encoded / indirect exploits
     (
@@ -115,6 +141,7 @@ const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
         PolicyAction::Warn,
         "Encoded or indirect code execution attempt",
         r"(?i)(base64_decode|eval\s*\(|exec\s*\(|__import__)",
+        PolicyScope::InputOnly,
     ),
     // 6. Path traversal
     (
@@ -123,6 +150,7 @@ const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
         PolicyAction::Sanitize,
         "Path traversal attempt",
         r"(\.\./|\.\.\\|%2[eE]%2[eE])",
+        PolicyScope::Both,
     ),
     // 7. Sensitive environment variable references
     (
@@ -131,6 +159,7 @@ const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str)] = &[
         PolicyAction::Warn,
         "Reference to sensitive environment variable",
         r"(?i)(DATABASE_URL|SECRET_KEY|PRIVATE_KEY)",
+        PolicyScope::Both,
     ),
 ];
 
@@ -159,18 +188,19 @@ impl PolicyEngine {
     /// silently skipped -- this mirrors the approach used by the existing
     /// `ShellSecurityConfig`.
     pub fn new() -> Self {
-        let patterns: Vec<&str> = RULE_DEFS.iter().map(|(_, _, _, _, pat)| *pat).collect();
+        let patterns: Vec<&str> = RULE_DEFS.iter().map(|r| r.4).collect();
 
         let set = RegexSet::new(&patterns).expect("static policy patterns must compile");
 
         let rules: Vec<CompiledRule> = RULE_DEFS
             .iter()
-            .filter_map(|(name, sev, act, desc, pat)| {
+            .filter_map(|(name, sev, act, desc, pat, scope)| {
                 Regex::new(pat).ok().map(|regex| CompiledRule {
                     name,
                     severity: sev.clone(),
                     action: act.clone(),
                     description: desc,
+                    scope: *scope,
                     pattern: regex,
                 })
             })
@@ -179,10 +209,7 @@ impl PolicyEngine {
         Self { set, rules }
     }
 
-    /// Check `input` against all policy rules.
-    ///
-    /// Returns a (possibly empty) list of violations. Multiple rules can
-    /// match the same input.
+    /// Check `input` against all policy rules (no direction filter).
     pub fn check(&self, input: &str) -> Vec<PolicyViolation> {
         self.check_with_ignored_rules(input, &[])
     }
@@ -193,7 +220,25 @@ impl PolicyEngine {
         input: &str,
         ignored_rules: &[&str],
     ) -> Vec<PolicyViolation> {
-        // Fast path: if no patterns match, return immediately.
+        self.check_impl(input, ignored_rules, None)
+    }
+
+    /// Check `input` respecting both direction scope and explicit ignore list.
+    pub fn check_for_direction(
+        &self,
+        input: &str,
+        ignored_rules: &[&str],
+        is_output: bool,
+    ) -> Vec<PolicyViolation> {
+        self.check_impl(input, ignored_rules, Some(is_output))
+    }
+
+    fn check_impl(
+        &self,
+        input: &str,
+        ignored_rules: &[&str],
+        is_output: Option<bool>,
+    ) -> Vec<PolicyViolation> {
         let matches: Vec<usize> = self.set.matches(input).into_iter().collect();
         if matches.is_empty() {
             return Vec::new();
@@ -204,6 +249,9 @@ impl PolicyEngine {
         for idx in matches {
             let rule = &self.rules[idx];
             if ignored_rules.contains(&rule.name) {
+                continue;
+            }
+            if is_output == Some(true) && rule.scope == PolicyScope::InputOnly {
                 continue;
             }
             let matched_text = rule.pattern.find(input).map(|m| m.as_str().to_string());
@@ -393,6 +441,44 @@ mod tests {
         assert!(
             v.iter().any(|v| v.rule_name == "sql_injection"),
             "case-insensitive SQL check failed"
+        );
+    }
+
+    // -- Direction scoping -------------------------------------------------
+
+    #[test]
+    fn test_input_only_rules_fire_on_input() {
+        let e = engine();
+        let v = e.check_for_direction("result=$(whoami)", &[], false);
+        assert!(
+            v.iter().any(|v| v.rule_name == "shell_injection"),
+            "shell_injection should fire on input"
+        );
+    }
+
+    #[test]
+    fn test_input_only_rules_skipped_on_output() {
+        let e = engine();
+        // Markdown code block from a web page — contains backticks and $()
+        let web_output = "Install: `curl https://example.com/install.sh | sh`\nRun: $(make build)";
+        let v = e.check_for_direction(web_output, &[], true);
+        assert!(
+            !v.iter().any(|v| v.rule_name == "shell_injection"),
+            "shell_injection must not fire on output"
+        );
+        assert!(
+            !v.iter().any(|v| v.rule_name == "encoded_exploits"),
+            "encoded_exploits must not fire on output"
+        );
+    }
+
+    #[test]
+    fn test_both_scope_rules_fire_on_output() {
+        let e = engine();
+        let v = e.check_for_direction("cat /etc/passwd", &[], true);
+        assert!(
+            v.iter().any(|v| v.rule_name == "system_file_access"),
+            "Both-scope rules should still fire on output"
         );
     }
 }

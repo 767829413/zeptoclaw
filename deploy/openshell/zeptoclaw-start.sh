@@ -17,24 +17,28 @@ log() { echo "[zeptoclaw-start] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"; }
 # /proc/self/environ.
 # ---------------------------------------------------------------------------
 
-CREDS_DIR="/sandbox/_creds"
 CREDS_FILE=""
 
-if [ -d "${CREDS_DIR}" ]; then
-    CREDS_FILE=$(find "${CREDS_DIR}" -maxdepth 1 -type f -print -quit 2>/dev/null)
-elif [ -f "${CREDS_DIR}" ]; then
-    CREDS_FILE="${CREDS_DIR}"
-fi
+# Check hostPath mount first (persistent volume), then legacy upload path
+for _creds_candidate in "/sandbox/.zeptoclaw/_creds" "/sandbox/_creds"; do
+    if [ -d "${_creds_candidate}" ]; then
+        CREDS_FILE=$(find "${_creds_candidate}" -maxdepth 1 -type f -print -quit 2>/dev/null)
+        break
+    elif [ -f "${_creds_candidate}" ]; then
+        CREDS_FILE="${_creds_candidate}"
+        break
+    fi
+done
 
 if [ -n "${CREDS_FILE}" ] && [ -f "${CREDS_FILE}" ]; then
     while IFS='=' read -r _key _val; do
         [[ "${_key}" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
         printf -v "_SEC_${_key}" '%s' "${_val}"
     done < "${CREDS_FILE}"
-    rm -rf "${CREDS_DIR}"
-    log "Loaded credentials from uploaded file (env vars unchanged)"
+    rm -f "${CREDS_FILE}"
+    log "Loaded credentials from ${CREDS_FILE} (env vars unchanged)"
 else
-    log "WARN: credentials not found at ${CREDS_DIR} — falling back to env vars (may contain placeholders)"
+    log "WARN: credentials not found — falling back to env vars (may contain placeholders)"
 fi
 
 _cred() {
@@ -51,6 +55,14 @@ mkdir -p "${CONFIG_DIR}/workspace" \
          "${CONFIG_DIR}/cron" \
          "${CONFIG_DIR}/memory" \
          "${HOME}/skills"
+
+# --- Fast path: reuse existing config on pod restart ---
+# If config.json already exists (from a previous run on the persistent volume)
+# and credentials are not available, skip regeneration and go straight to exec.
+if [ -f "${CONFIG_FILE}" ] && [ -z "${CREDS_FILE}" ]; then
+    log "Reusing existing ${CONFIG_FILE} (no new credentials)"
+    exec zeptoclaw gateway
+fi
 
 # --- Populate workspace bootstrap files (only if not already present) ---
 DEFAULTS_DIR="/etc/zeptoclaw/workspace-defaults"

@@ -59,6 +59,7 @@
 #[cfg(feature = "android")]
 pub mod android;
 pub mod approval;
+pub mod approval_broker;
 pub mod binary_plugin;
 pub mod browser;
 pub mod clarification;

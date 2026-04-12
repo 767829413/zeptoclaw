@@ -121,7 +121,16 @@ pub struct ApprovalConfig {
     /// If greater than zero, auto-approve after this many seconds without
     /// a response. `0` means no auto-approve (wait indefinitely).
     pub auto_approve_timeout_secs: u64,
+
+    /// How long (in seconds) the gateway approval handler waits for a user
+    /// reply before returning `TimedOut`. `0` means use the default (120s).
+    /// This is independent of `auto_approve_timeout_secs`.
+    #[serde(default)]
+    pub approval_timeout_secs: u64,
 }
+
+/// Default gateway approval timeout when `approval_timeout_secs` is 0.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
 impl Default for ApprovalConfig {
     fn default() -> Self {
@@ -131,6 +140,7 @@ impl Default for ApprovalConfig {
             require_for: Vec::new(),
             dangerous_tools: ApprovalGate::default_dangerous_tools(),
             auto_approve_timeout_secs: 0,
+            approval_timeout_secs: 0,
         }
     }
 }
@@ -152,6 +162,13 @@ pub struct ApprovalRequest {
     /// If auto-approve is enabled, the deadline after which the request
     /// is automatically approved. `None` means wait indefinitely.
     pub auto_approve_at: Option<DateTime<Utc>>,
+    /// Channel the originating message came from (routing context for the
+    /// approval handler to send the prompt back).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Chat/conversation ID (routing context).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -171,7 +188,17 @@ impl ApprovalRequest {
             arguments,
             timestamp,
             auto_approve_at,
+            channel: None,
+            chat_id: None,
         }
+    }
+
+    /// Attach routing context so the approval handler knows where to send
+    /// the prompt and where to expect the reply.
+    pub fn with_routing(mut self, channel: Option<&str>, chat_id: Option<&str>) -> Self {
+        self.channel = channel.map(|s| s.to_string());
+        self.chat_id = chat_id.map(|s| s.to_string());
+        self
     }
 
     /// Check whether this request has passed its auto-approve deadline.
@@ -667,6 +694,7 @@ mod tests {
                 "edit_file".to_string(),
             ],
             auto_approve_timeout_secs: 30,
+            approval_timeout_secs: 0,
         };
 
         let json_str = serde_json::to_string(&config).expect("serialize");

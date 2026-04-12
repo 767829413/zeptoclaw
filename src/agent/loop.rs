@@ -74,13 +74,18 @@ async fn resolve_tool_approval(
     approval_handler: Option<&ApprovalHandler>,
     tool_name: &str,
     args: &serde_json::Value,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
 ) -> Option<String> {
     if !gate.requires_approval(tool_name) {
         return None;
     }
 
     if let Some(handler) = approval_handler {
-        match handler(gate.create_request(tool_name, args)).await {
+        let request = gate
+            .create_request(tool_name, args)
+            .with_routing(channel, chat_id);
+        match handler(request).await {
             ApprovalResponse::Approved => None,
             ApprovalResponse::Denied(reason) => Some(format!(
                 "Tool '{}' was denied by user approval. {}",
@@ -241,6 +246,11 @@ fn propagate_routing_metadata(outbound: &mut OutboundMessage, inbound: &InboundM
         outbound
             .metadata
             .insert("telegram_message_id".to_string(), mid.clone());
+    }
+    if let Some(mid) = inbound.metadata.get("discord_message_id") {
+        outbound
+            .metadata
+            .insert("discord_message_id".to_string(), mid.clone());
     }
 }
 
@@ -1477,6 +1487,8 @@ impl AgentLoop {
                                 approval_handler.as_ref(),
                                 &name,
                                 &args,
+                                ctx.channel.as_deref(),
+                                ctx.chat_id.as_deref(),
                             )
                             .await
                             {
@@ -2400,6 +2412,8 @@ impl AgentLoop {
                                 approval_handler.as_ref(),
                                 &name,
                                 &args,
+                                ctx.channel.as_deref(),
+                                ctx.chat_id.as_deref(),
                             )
                             .await
                             {

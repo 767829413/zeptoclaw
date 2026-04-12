@@ -49,6 +49,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+/// Synchronous predicate that inspects an inbound message before it enters the
+/// queue.  Return `true` to consume (intercept) the message so it is never
+/// delivered to the agent loop.
+pub type InboundInterceptor = Arc<dyn Fn(&InboundMessage) -> bool + Send + Sync>;
+
 /// Default buffer size for message channels
 const DEFAULT_BUFFER_SIZE: usize = 100;
 
@@ -69,6 +74,9 @@ pub struct MessageBus {
     outbound_tx: mpsc::Sender<OutboundMessage>,
     /// Receiver for outbound messages (wrapped in Arc<Mutex> for shared access)
     outbound_rx: Arc<Mutex<mpsc::Receiver<OutboundMessage>>>,
+    /// Optional interceptor that can consume inbound messages before they
+    /// reach the agent loop (e.g. for tool-approval "yes/no" replies).
+    inbound_interceptor: Arc<std::sync::RwLock<Option<InboundInterceptor>>>,
 }
 
 impl MessageBus {
@@ -106,6 +114,7 @@ impl MessageBus {
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
             outbound_tx,
             outbound_rx: Arc::new(Mutex::new(outbound_rx)),
+            inbound_interceptor: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -132,6 +141,13 @@ impl MessageBus {
     /// }
     /// ```
     pub async fn publish_inbound(&self, msg: InboundMessage) -> Result<()> {
+        if let Ok(guard) = self.inbound_interceptor.read() {
+            if let Some(interceptor) = guard.as_ref() {
+                if interceptor(&msg) {
+                    return Ok(());
+                }
+            }
+        }
         self.inbound_tx
             .send(msg)
             .await
@@ -253,6 +269,13 @@ impl MessageBus {
     /// - `Err(ZeptoError::BusClosed)` if the channel is closed
     /// - `Err(ZeptoError::Channel)` if the buffer is full
     pub fn try_publish_inbound(&self, msg: InboundMessage) -> Result<()> {
+        if let Ok(guard) = self.inbound_interceptor.read() {
+            if let Some(interceptor) = guard.as_ref() {
+                if interceptor(&msg) {
+                    return Ok(());
+                }
+            }
+        }
         self.inbound_tx.try_send(msg).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 ZeptoError::Channel("inbound buffer full".to_string())
@@ -269,6 +292,20 @@ impl MessageBus {
             }
             mpsc::error::TrySendError::Closed(_) => ZeptoError::BusClosed,
         })
+    }
+
+    /// Install an inbound interceptor.
+    ///
+    /// The interceptor is called synchronously for every inbound message
+    /// *before* it is queued. If it returns `true` the message is consumed
+    /// and never reaches the agent loop.
+    ///
+    /// **Note:** Messages sent via [`inbound_sender`] bypass this interceptor.
+    pub fn set_inbound_interceptor(&self, f: InboundInterceptor) {
+        *self
+            .inbound_interceptor
+            .write()
+            .expect("interceptor RwLock poisoned") = Some(f);
     }
 }
 
@@ -288,6 +325,7 @@ impl Clone for MessageBus {
             inbound_rx: Arc::clone(&self.inbound_rx),
             outbound_tx: self.outbound_tx.clone(),
             outbound_rx: Arc::clone(&self.outbound_rx),
+            inbound_interceptor: Arc::clone(&self.inbound_interceptor),
         }
     }
 }

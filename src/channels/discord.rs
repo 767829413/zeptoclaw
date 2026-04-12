@@ -18,9 +18,11 @@ use async_trait::async_trait;
 use futures::{FutureExt, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::{hash_map::DefaultHasher, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -65,6 +67,38 @@ const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 const DISCORD_CHANNEL_TYPE_GUILD_FORUM: u8 = 15;
 const DISCORD_CHANNEL_TYPE_GUILD_MEDIA: u8 = 16;
 const MAX_PROXY_CONNECT_RESPONSE_BYTES: usize = 8 * 1024;
+const INBOUND_DEDUP_TTL_SECS: u64 = 600;
+const INBOUND_DEDUP_MAX_ENTRIES: usize = 4096;
+
+#[derive(Default)]
+struct InboundDedup {
+    seen: HashSet<String>,
+    order: VecDeque<(String, Instant)>,
+}
+
+impl InboundDedup {
+    fn contains_or_insert(&mut self, message_id: &str) -> bool {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(INBOUND_DEDUP_TTL_SECS);
+        while let Some((_, ts)) = self.order.front() {
+            if now.duration_since(*ts) > ttl || self.order.len() > INBOUND_DEDUP_MAX_ENTRIES {
+                let (expired_id, _) = self.order.pop_front().expect("order.front() returned Some");
+                self.seen.remove(&expired_id);
+            } else {
+                break;
+            }
+        }
+
+        if self.seen.contains(message_id) {
+            return true;
+        }
+
+        let id = message_id.to_string();
+        self.seen.insert(id.clone());
+        self.order.push_back((id, now));
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Gateway payload types (deserialization)
@@ -624,6 +658,37 @@ impl DiscordChannel {
     // Outbound payload construction
     // -----------------------------------------------------------------------
 
+    fn outbound_nonce(msg: &OutboundMessage) -> String {
+        // Use the inbound Discord message ID when available so retries caused by
+        // duplicate inbound delivery generate the same nonce and are collapsed
+        // by Discord's idempotency semantics.
+        if let Some(source_id) = msg
+            .metadata
+            .get("discord_message_id")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            let mut hasher = DefaultHasher::new();
+            source_id.hash(&mut hasher);
+            msg.chat_id.hash(&mut hasher);
+            msg.content.hash(&mut hasher);
+            msg.reply_to.hash(&mut hasher);
+            return format!("{}", hasher.finish());
+        }
+
+        let mut hasher = DefaultHasher::new();
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        std::process::id().hash(&mut hasher);
+        msg.chat_id.hash(&mut hasher);
+        msg.content.hash(&mut hasher);
+        msg.reply_to.hash(&mut hasher);
+        format!("{}", hasher.finish())
+    }
+
     /// Builds the JSON body for a channel message POST request.
     fn build_send_payload(msg: &OutboundMessage) -> Result<Value> {
         let channel_id = msg.chat_id.trim();
@@ -646,7 +711,8 @@ impl DiscordChannel {
             msg.content.to_string()
         };
 
-        let mut payload = json!({ "content": content });
+        let nonce = Self::outbound_nonce(msg);
+        let mut payload = json!({ "content": content, "nonce": nonce });
 
         // If replying to a specific message, attach a message_reference.
         if let Some(ref reply_id) = msg.reply_to {
@@ -836,6 +902,7 @@ impl DiscordChannel {
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let mut reconnect_attempt: u32 = 0;
+        let mut inbound_dedup = InboundDedup::default();
 
         loop {
             // Check shutdown before each connection attempt.
@@ -1059,6 +1126,22 @@ impl DiscordChannel {
                                                             if let Some(mut inbound) =
                                                                 Self::parse_message_create(data, &allowlist, deny_by_default)
                                                             {
+                                                                if let Some(discord_message_id) = inbound
+                                                                    .metadata
+                                                                    .get("discord_message_id")
+                                                                    .map(String::as_str)
+                                                                {
+                                                                    if inbound_dedup
+                                                                        .contains_or_insert(discord_message_id)
+                                                                    {
+                                                                        debug!(
+                                                                            "Discord: duplicate MESSAGE_CREATE ignored (id={})",
+                                                                            discord_message_id
+                                                                        );
+                                                                        continue;
+                                                                    }
+                                                                }
+
                                                                 // Download image and text document attachments
                                                                 if let Ok(msg_data) = serde_json::from_value::<MessageCreateData>(data.clone()) {
                                                                     let mut attachment_info = Vec::new();
@@ -1080,11 +1163,16 @@ impl DiscordChannel {
 
                                                                         let content_type = att.content_type.as_ref().unwrap();
 
-                                                                        // Determine media type - only handle images and text documents
                                                                         let media_type = if content_type.starts_with("image/") {
                                                                             Some(MediaType::Image)
                                                                         } else if content_type.starts_with("text/")
-                                                                            || content_type == "application/json" {
+                                                                            || content_type == "application/json"
+                                                                            || content_type == "application/pdf"
+                                                                            || content_type == "application/xml"
+                                                                            || content_type == "application/javascript"
+                                                                            || content_type == "application/x-yaml"
+                                                                            || content_type == "application/toml"
+                                                                            || content_type == "application/octet-stream" {
                                                                             Some(MediaType::Document)
                                                                         } else {
                                                                             None
@@ -1585,6 +1673,13 @@ mod tests {
         let payload = DiscordChannel::build_send_payload(&msg).expect("should build payload");
 
         assert_eq!(payload["content"], "Hello back!");
+        let nonce = payload["nonce"].as_str().expect("nonce should be a string");
+        assert!(nonce.len() <= 25, "nonce too long: {}", nonce.len());
+        assert!(
+            nonce.chars().all(|c| c.is_ascii_digit()),
+            "nonce must be numeric: {}",
+            nonce
+        );
         assert!(payload.get("message_reference").is_none());
     }
 

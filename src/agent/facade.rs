@@ -930,7 +930,7 @@ mod tests {
                 policy: ApprovalPolicyConfig::RequireForTools,
                 require_for: vec!["dangerous_tool".into()],
                 dangerous_tools: vec![],
-                auto_approve_timeout_secs: 0,
+                ..Default::default()
             })
             .approval_handler(|_| async { ApprovalResponse::Denied("nope".into()) })
             .build()
@@ -963,7 +963,7 @@ mod tests {
                 policy: ApprovalPolicyConfig::RequireForTools,
                 require_for: vec!["dangerous_tool".into()],
                 dangerous_tools: vec![],
-                auto_approve_timeout_secs: 0,
+                ..Default::default()
             })
             .approval_handler(|_| async { ApprovalResponse::Approved })
             .build()

@@ -1018,9 +1018,7 @@ mod tests {
         let mut config = Config::default();
         config.providers.azure = Some(ProviderConfig {
             api_key: Some("my-entra-token".to_string()),
-            api_base: Some(
-                "https://myco.openai.azure.com/openai/deployments/gpt-4o".to_string(),
-            ),
+            api_base: Some("https://myco.openai.azure.com/openai/deployments/gpt-4o".to_string()),
             auth_header: Some("bearer".to_string()),
             ..Default::default()
         });
@@ -1036,9 +1034,7 @@ mod tests {
         let mut config = Config::default();
         config.providers.azure = Some(ProviderConfig {
             api_key: Some("my-entra-token".to_string()),
-            api_base: Some(
-                "https://myco.openai.azure.com/openai/deployments/gpt-4o".to_string(),
-            ),
+            api_base: Some("https://myco.openai.azure.com/openai/deployments/gpt-4o".to_string()),
             auth_header: Some("Bearer".to_string()),
             ..Default::default()
         });

@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use zeptoclaw::bus::MessageBus;
+use zeptoclaw::bus::{InboundInterceptor, MessageBus, OutboundMessage};
 use zeptoclaw::channels::{register_configured_channels, ChannelManager};
 use zeptoclaw::config::watcher::ConfigWatcher;
 use zeptoclaw::config::{Config, ContainerAgentBackend};
@@ -19,6 +20,10 @@ use zeptoclaw::heartbeat::{ensure_heartbeat_file, HeartbeatService};
 use zeptoclaw::providers::{
     configured_provider_names, resolve_runtime_provider, RUNTIME_SUPPORTED_PROVIDERS,
 };
+use zeptoclaw::tools::approval::{
+    ApprovalRequest, ApprovalResponse, DEFAULT_APPROVAL_TIMEOUT_SECS,
+};
+use zeptoclaw::tools::approval_broker::ApprovalBroker;
 
 use super::common::create_agent;
 use super::heartbeat::heartbeat_file_path;
@@ -298,6 +303,38 @@ pub(crate) async fn cmd_gateway(
         None
     };
 
+    // --- Tool-approval handler (generic, works for all channels) ----------
+    let broker = Arc::new(ApprovalBroker::new());
+
+    // Inbound interceptor: consume "yes/no" replies when an approval is pending.
+    bus.set_inbound_interceptor({
+        let broker = Arc::clone(&broker);
+        Arc::new(move |msg: &zeptoclaw::bus::InboundMessage| {
+            let text = msg.content.trim().to_lowercase();
+            // "yes all" / "no all" / "approve all" / "deny all" — resolve every pending
+            let all = text.ends_with(" all") || text == "all" || text == "全部";
+            let approved = match text
+                .trim_end_matches(" all")
+                .trim_end_matches("全部")
+                .trim()
+            {
+                "yes" | "y" | "approve" | "是" => Some(true),
+                "no" | "n" | "deny" | "否" => Some(false),
+                _ => None,
+            };
+            match (approved, all) {
+                (Some(value), true) => broker.resolve_all(&msg.chat_id, value) > 0,
+                (Some(value), false) => broker.resolve(&msg.chat_id, value),
+                _ => false,
+            }
+        }) as InboundInterceptor
+    });
+
+    let approval_timeout = resolve_approval_timeout(&config);
+    if let Some(ref agent) = agent {
+        register_approval_handler(agent, &broker, &bus, approval_timeout).await;
+    }
+
     // Create channel manager with health supervision
     let mut channel_manager = ChannelManager::new(bus.clone(), config.clone());
     channel_manager.set_health_registry(health_registry.clone());
@@ -476,6 +513,7 @@ pub(crate) async fn cmd_gateway(
                     match create_agent(config.clone(), bus.clone()).await {
                         Ok(new_agent) => {
                             new_agent.set_usage_metrics(Arc::clone(&metrics)).await;
+                            register_approval_handler(&new_agent, &broker, &bus, approval_timeout).await;
                             let agent_clone = Arc::clone(&new_agent);
                             let agent_metrics = Arc::clone(&metrics);
                             let agent_guard = guard.clone();
@@ -639,6 +677,92 @@ fn diff_hot_reload_sections(old: &Config, new: &Config) -> Vec<&'static str> {
 
 fn section_changed<T: serde::Serialize>(old: &T, new: &T) -> bool {
     serde_json::to_value(old).ok() != serde_json::to_value(new).ok()
+}
+
+fn resolve_approval_timeout(config: &Config) -> u64 {
+    let t = config.approval.approval_timeout_secs;
+    if t > 0 {
+        t
+    } else {
+        DEFAULT_APPROVAL_TIMEOUT_SECS
+    }
+}
+
+async fn register_approval_handler(
+    agent: &zeptoclaw::agent::AgentLoop,
+    broker: &Arc<ApprovalBroker>,
+    bus: &Arc<MessageBus>,
+    timeout_secs: u64,
+) {
+    let broker = Arc::clone(broker);
+    let bus = Arc::clone(bus);
+    agent
+        .set_approval_handler(move |request: ApprovalRequest| {
+            let broker = Arc::clone(&broker);
+            let bus = Arc::clone(&bus);
+            async move {
+                let chat_id = match request.chat_id.as_deref() {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => return ApprovalResponse::Denied("No chat routing context for approval".into()),
+                };
+                let channel = match request.channel.as_deref() {
+                    Some(ch) if !ch.is_empty() => ch.to_string(),
+                    _ => return ApprovalResponse::Denied("No channel routing context for approval".into()),
+                };
+
+                let rx = broker.register(&chat_id);
+
+                // Format the approval prompt. Shell commands get a clean code-block
+                // display; other tools show pretty-printed JSON arguments.
+                let args_display = if request.tool_name == "shell" {
+                    let cmd = request
+                        .arguments
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<no command>");
+                    let timeout = request
+                        .arguments
+                        .get("timeout")
+                        .and_then(|v| v.as_u64())
+                        .map(|t| format!("  timeout: {}s", t))
+                        .unwrap_or_default();
+                    format!("```sh\n{}\n```{}", cmd, if timeout.is_empty() { String::new() } else { format!("\n{}", timeout) })
+                } else {
+                    let pretty = serde_json::to_string_pretty(&request.arguments)
+                        .unwrap_or_else(|_| request.arguments.to_string());
+                    format!("```json\n{}\n```", pretty)
+                };
+
+                let pending = broker.pending_count(&chat_id);
+                let batch_hint = if pending > 1 {
+                    format!("\n({} more pending — reply **yes all** / **no all** to resolve all at once)", pending)
+                } else {
+                    String::new()
+                };
+
+                let prompt = format!(
+                    "**[Approval Required]** — `{}`\n{}\nReply **yes** / **no** (or **yes all** / **no all**).{}",
+                    request.tool_name,
+                    args_display,
+                    batch_hint,
+                );
+                let _ = bus
+                    .publish_outbound(OutboundMessage::new(&channel, &chat_id, &prompt))
+                    .await;
+
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+                    Ok(Ok(true)) => ApprovalResponse::Approved,
+                    Ok(Ok(false)) => ApprovalResponse::Denied("User denied".into()),
+                    _ => ApprovalResponse::TimedOut,
+                }
+            }
+            .boxed()
+        })
+        .await;
+    info!(
+        "Registered generic tool-approval handler (timeout={}s)",
+        timeout_secs
+    );
 }
 
 #[cfg(test)]

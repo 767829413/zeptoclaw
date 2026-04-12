@@ -140,7 +140,7 @@ impl SafetyLayer {
     fn scan_impl(
         &self,
         text: &str,
-        _direction: CheckDirection,
+        direction: CheckDirection,
         options: &ScanOptions<'_>,
     ) -> SafetyResult {
         let mut warnings: Vec<String> = Vec::new();
@@ -233,10 +233,12 @@ impl SafetyLayer {
             content.to_string()
         };
 
-        // 4. Policy checks
-        let violations = self
-            .policy_engine
-            .check_with_ignored_rules(&content, options.ignored_policy_rules);
+        // 4. Policy checks (InputOnly rules are skipped for Output direction)
+        let violations = self.policy_engine.check_for_direction(
+            &content,
+            options.ignored_policy_rules,
+            direction == CheckDirection::Output,
+        );
         for v in &violations {
             match v.action {
                 PolicyAction::Block => {
