@@ -11,6 +11,7 @@
     }
   },
   "memory": {
+    "backend": "bm25",
     "extra_paths": ["skills"]
   },
   "gateway": {

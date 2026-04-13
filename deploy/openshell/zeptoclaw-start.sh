@@ -67,7 +67,7 @@ fi
 # --- Populate workspace bootstrap files (only if not already present) ---
 DEFAULTS_DIR="/etc/zeptoclaw/workspace-defaults"
 if [ -d "$DEFAULTS_DIR" ]; then
-    for f in IDENTITY.md AGENTS.md SOUL.md USER.md TOOLS.md; do
+    for f in IDENTITY.md AGENTS.md SOUL.md USER.md TOOLS.md MEMORY.md; do
         if [ -f "${DEFAULTS_DIR}/${f}" ] && [ ! -f "${CONFIG_DIR}/workspace/${f}" ]; then
             cp "${DEFAULTS_DIR}/${f}" "${CONFIG_DIR}/workspace/${f}"
             log "Initialized workspace/${f} from defaults"
@@ -157,6 +157,10 @@ cat > "${CONFIG_FILE}" <<EOJSON
       "max_crashes": 3,
       "window_secs": 300
     }
+  },
+  "memory": {
+    "backend": "bm25",
+    "extra_paths": ["skills"]
   },
   "tools": {
     "shell": {
