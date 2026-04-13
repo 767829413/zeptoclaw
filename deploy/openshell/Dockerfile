@@ -33,8 +33,8 @@ RUN mkdir -p /sandbox/.zeptoclaw/workspace \
              /sandbox/.zeptoclaw/logs \
              /sandbox/.zeptoclaw/cron \
              /sandbox/.zeptoclaw/memory \
-             /sandbox/skills && \
-    chown -R sandbox:sandbox /sandbox/.zeptoclaw /sandbox/skills
+             /sandbox/.zeptoclaw/workspace/skills && \
+    chown -R sandbox:sandbox /sandbox/.zeptoclaw
 
 USER sandbox
 

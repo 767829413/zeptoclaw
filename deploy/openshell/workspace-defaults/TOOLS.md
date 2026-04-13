@@ -94,6 +94,30 @@ Images must be **HTTPS URLs**. The MCP server downloads them internally. Never u
 
 Title max 20 characters, content max 1000 characters. Add tags for better reach.
 
+#### Image diversity (MUST)
+
+Before calling `xiaohongshu_publish_content`, enforce these checks:
+- Fetch recent posts via `xiaohongshu_my_profile`.
+- Compare candidate `images` against image URLs in recent posts (at least last 10 posts).
+- Normalize URLs before compare: trim spaces and remove query string (`?` and later).
+- If any normalized URL is reused, replace it with a different image URL.
+- Default behavior: user provides only image theme (for example "random landscape" or "random animals"), and the agent must auto-collect image URLs.
+
+Hard rule:
+- Never publish if the first image is the same as any of the last 5 posts' first image.
+
+#### Auto image sourcing (MUST)
+
+Do not ask users to provide image URLs in normal flow. Use this pipeline:
+- Input: image theme text from user (for example "random landscape", "random cat").
+- Collect at least 20 candidate HTTPS image URLs from web search results.
+- Keep only direct image links that end with common image extensions or have image content-type.
+- Randomly sample 3-9 images from unique domains and unique normalized URLs.
+- Run the Image diversity checks above, then publish.
+
+Fallback:
+- If auto-sourcing fails after one retry, report failure and ask user whether to retry with a broader theme.
+
 ### Cookie Expiration
 
 When any tool returns an error containing "Cookie 已过期", tell the user their cookies have expired and ask them to provide new cookies from their browser.

@@ -54,7 +54,7 @@ mkdir -p "${CONFIG_DIR}/workspace" \
          "${CONFIG_DIR}/logs" \
          "${CONFIG_DIR}/cron" \
          "${CONFIG_DIR}/memory" \
-         "${HOME}/skills"
+         "${CONFIG_DIR}/workspace/skills"
 
 # --- Fast path: reuse existing config on pod restart ---
 # If config.json already exists (from a previous run on the persistent volume)
@@ -74,8 +74,8 @@ if [ -d "$DEFAULTS_DIR" ]; then
         fi
     done
     if [ -d "${DEFAULTS_DIR}/skills" ]; then
-        cp -rn "${DEFAULTS_DIR}/skills/"* "${HOME}/skills/" 2>/dev/null || true
-        SKILL_COUNT=$(find "${HOME}/skills" -name "SKILL.md" 2>/dev/null | wc -l)
+        cp -rn "${DEFAULTS_DIR}/skills/"* "${CONFIG_DIR}/workspace/skills/" 2>/dev/null || true
+        SKILL_COUNT=$(find "${CONFIG_DIR}/workspace/skills" -name "SKILL.md" 2>/dev/null | wc -l)
         log "Skills directory: ${SKILL_COUNT} skill(s) available"
     fi
 fi

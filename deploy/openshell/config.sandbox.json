@@ -10,6 +10,9 @@
       "workspace": "/sandbox/.zeptoclaw/workspace"
     }
   },
+  "memory": {
+    "extra_paths": ["skills"]
+  },
   "gateway": {
     "host": "0.0.0.0",
     "port": 8080

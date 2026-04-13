@@ -31,6 +31,31 @@ Key rules:
 - Content supports newlines and #hashtags
 - Wait for publish confirmation before reporting success
 
+## Image De-dup Workflow (MUST)
+
+To avoid repeated cover images and repetitive post visuals:
+
+1. Before each publish, call `my_profile` and collect recent posts (at least 10).
+2. User should provide image theme only (for example "random landscape", "random animals"), not fixed image URLs.
+3. Auto-source candidate image URLs from web search:
+   - get at least 20 candidate HTTPS URLs
+   - keep direct image links only
+4. For candidate image URLs, normalize first:
+   - trim whitespace
+   - remove query string (`?` and suffix)
+5. Compare normalized candidates against recent post images:
+   - if any candidate is already used recently, replace it
+6. Cover image rule:
+   - first image in `images[]` MUST NOT match the first image of any of the last 5 posts
+7. Build final images list:
+   - randomly select 3-9 images
+   - prefer domain diversity (avoid all images from one host)
+8. If auto-sourcing fails:
+   - retry once with broader keywords
+   - if still failing, ask user only whether to broaden theme (do not ask user to provide URLs)
+
+Never "just reuse" old URLs to finish a task quickly.
+
 ## Search Notes
 
 ```
