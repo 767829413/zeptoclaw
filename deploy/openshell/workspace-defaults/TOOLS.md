@@ -18,6 +18,7 @@ curl -sL "https://r.jina.ai/https://x.com/someuser/status/123456"
 Rules:
 - Use `shell` tool to run `curl -sL "https://r.jina.ai/<URL>"`
 - Put the full target URL after `https://r.jina.ai/` — no encoding needed
+- **Strip tracking parameters** before fetching: remove `?s=`, `?t=`, `?utm_*`, `?ref=`, `?si=` and similar tracking query params from the URL. These cause sites like Twitter/X to return login walls instead of content. Keep only parameters essential to content (e.g., `?v=` for YouTube).
 - Free, no API key required
 - If Jina is down or returns an error, fall back to `web_fetch`
 - For search, still use `web_search` tool (not Jina)

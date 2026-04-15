@@ -115,6 +115,13 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/zeptoclaw }
 
+  searxng:
+    name: searxng
+    endpoints:
+      - { host: 172.17.0.1, port: 8888 }
+    binaries:
+      - { path: /usr/local/bin/zeptoclaw }
+
   # =====================================================================
   # Web access — search engines and common web domains
   # OpenShell rejects bare `host: "*"`, so we enumerate TLD-level patterns.
