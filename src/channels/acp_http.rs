@@ -728,7 +728,18 @@ impl AcpHttpChannel {
                     Ok(Ok(n)) => {
                         total += n;
                         if let Some(hend) = Self::find_header_end(&buf[..total]) {
-                            if let Some(req) = Self::parse_request(&buf[..total]) {
+                            // Only parse the header section here. `parse_request`
+                            // does `from_utf8` on whatever slice it gets, and the
+                            // body is still being read — if a UTF-8 multi-byte
+                            // character (e.g. CJK) lands across a TCP boundary,
+                            // `from_utf8(&buf[..total])` will fail and the old
+                            // `else break` would abort the read with body still
+                            // truncated, then the second `parse_request` at the
+                            // bottom of `handle_connection` would 400 with body
+                            // `{}`. Headers are ASCII (HTTP/1.1 RFC 7230 §3.2.4)
+                            // so a header-only slice is always valid UTF-8 once
+                            // `find_header_end` has matched.
+                            if let Some(req) = Self::parse_request(&buf[..hend + 4]) {
                                 let body_received = total - hend - 4;
                                 if body_received >= Self::content_length(&req.headers) {
                                     break;
@@ -1760,6 +1771,84 @@ mod tests {
         assert!(
             err_body.contains("-32600") || err_body.contains("-32000"),
             "rejection must be an RPC error: {err_body}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Read-loop UTF-8 boundary regression
+    //
+    // Repro for the HTTP-400 we hit when scope-isolated session/prompt requests
+    // started shipping multi-KB CJK histories: TCP read returns a partial buffer
+    // whose final byte falls inside a multi-byte UTF-8 char. The pre-fix code
+    // called `parse_request(&buf[..total])`, whose `from_utf8` would fail on the
+    // truncated tail; the read loop then `else break`d with the body still
+    // incomplete and the second `parse_request` 400'd with body `{}`.
+    //
+    // The fix passes `&buf[..hend + 4]` (header section only, ASCII-safe) to
+    // `parse_request` inside the read loop. These tests pin that contract.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_read_loop_parses_headers_with_partial_utf8_body() {
+        let body = "你好世界".repeat(1024);
+        let body_bytes = body.as_bytes();
+        let headers = format!(
+            "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body_bytes.len()
+        );
+        let mut buf = Vec::new();
+        buf.extend_from_slice(headers.as_bytes());
+        buf.extend_from_slice(body_bytes);
+
+        let hend = AcpHttpChannel::find_header_end(&buf).expect("header terminator present");
+
+        for body_chunk in [1usize, 5, 17, 31, 64, 257] {
+            let total = hend + 4 + body_chunk;
+            let raw = &buf[..total];
+
+            // Old behavior: full-buffer parse fails the moment a multi-byte
+            // char straddles `total` — exactly the bug.
+            if std::str::from_utf8(raw).is_err() {
+                assert!(
+                    AcpHttpChannel::parse_request(raw).is_none(),
+                    "sanity: pre-fix parse_request must fail on partial UTF-8"
+                );
+            }
+
+            // Post-fix contract: header-only slice is always parseable, and
+            // the read loop can compute body_received vs Content-Length.
+            let header_slice = &buf[..hend + 4];
+            let req = AcpHttpChannel::parse_request(header_slice)
+                .expect("header-only slice must parse regardless of body bytes");
+            let cl = AcpHttpChannel::content_length(&req.headers);
+            assert_eq!(cl, body_bytes.len());
+            let body_received = total - hend - 4;
+            assert!(
+                body_received < cl,
+                "loop must keep reading; body_received={body_received} cl={cl}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_loop_break_when_full_body_received() {
+        let body = "你好".to_string();
+        let body_bytes = body.as_bytes();
+        let headers = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body_bytes.len()
+        );
+        let mut buf = Vec::new();
+        buf.extend_from_slice(headers.as_bytes());
+        buf.extend_from_slice(body_bytes);
+
+        let hend = AcpHttpChannel::find_header_end(&buf).unwrap();
+        let req = AcpHttpChannel::parse_request(&buf[..hend + 4]).unwrap();
+        let cl = AcpHttpChannel::content_length(&req.headers);
+        let body_received = buf.len() - hend - 4;
+        assert!(
+            body_received >= cl,
+            "loop must terminate; body_received={body_received} cl={cl}"
         );
     }
 
