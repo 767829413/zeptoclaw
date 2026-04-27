@@ -6,6 +6,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Metadata key used to flag an [`OutboundMessage`] as carrying a delivery
+/// failure (e.g., LLM provider error) rather than a normal assistant reply.
+///
+/// Channels that understand the flag (currently the ACP family) surface the
+/// content as a protocol-level error; channels that don't simply render the
+/// text, which is a sane fallback.
+pub const OUTBOUND_ERROR_KEY: &str = "error";
+
 /// Represents an incoming message from a channel (e.g., Telegram, Discord, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundMessage {
@@ -25,6 +33,46 @@ pub struct InboundMessage {
     pub metadata: HashMap<String, String>,
 }
 
+/// Describes how a given [`OutboundMessage`] participates in a streaming
+/// reply. Only ACP-family channels interpret non-`Full` variants today;
+/// every other channel is routed only the `Full` variant by design (see
+/// `channels/manager.rs::dispatch_outbound` — dispatch is per-channel, not
+/// broadcast, so adding a variant here does **not** fan out to Telegram,
+/// Discord, etc.).
+///
+/// Reserved for B4-zc (token-level streaming through ACP): the agent loop
+/// emits a sequence of `Chunk` messages per LLM delta, followed by a
+/// single `ChunkEnd` to signal "stream complete". The ACP transport turns
+/// each `Chunk` into a `session/update(agent_message_chunk)` notification
+/// and uses `ChunkEnd` as the cue to close the `session/prompt` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundMessageKind {
+    /// A complete assistant reply. This is the historical shape of every
+    /// `OutboundMessage` and remains the default — all non-streaming
+    /// channels and the legacy non-streaming agent path use this.
+    #[default]
+    Full,
+    /// A streaming delta. `content` carries the incremental text to
+    /// append. Does **not** close the caller's pending request.
+    Chunk,
+    /// Terminal frame for a streaming reply. `content` is conventionally
+    /// empty (the full reply has already been transmitted via `Chunk`s).
+    /// Signals the ACP transport to write its `session/prompt` response.
+    ChunkEnd,
+}
+
+impl OutboundMessageKind {
+    /// Helper for `#[serde(skip_serializing_if)]` — lets us keep the
+    /// on-the-wire JSON identical to pre-B4-zc when nothing cares about
+    /// streaming (i.e. when the variant is `Full`). Coupled with
+    /// `#[serde(default)]` on the field, this gives full bidirectional
+    /// compatibility with payloads serialized by older builds.
+    fn is_full(&self) -> bool {
+        matches!(self, OutboundMessageKind::Full)
+    }
+}
+
 /// Represents an outgoing message to be sent via a channel
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundMessage {
@@ -39,6 +87,11 @@ pub struct OutboundMessage {
     /// Additional metadata key-value pairs for channel-specific delivery hints
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+    /// Streaming participation. Defaults to `Full` for both back-compat
+    /// (missing field in older JSON deserializes as `Full`) and for the
+    /// overwhelmingly common case.
+    #[serde(default, skip_serializing_if = "OutboundMessageKind::is_full")]
+    pub kind: OutboundMessageKind,
 }
 
 /// Represents a media attachment (image, audio, video, or document)
@@ -162,7 +215,31 @@ impl OutboundMessage {
             content: content.to_string(),
             reply_to: None,
             metadata: HashMap::new(),
+            kind: OutboundMessageKind::Full,
         }
+    }
+
+    /// Builder: mark this message as a streaming delta (see
+    /// [`OutboundMessageKind::Chunk`]). Only ACP channels act on this;
+    /// others ignore it by design.
+    pub fn with_kind(mut self, kind: OutboundMessageKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Marks this message as an error-carrying outbound. Error-aware channels
+    /// (e.g., ACP) translate it into a protocol-level error; other channels
+    /// render `content` as plain text.
+    pub fn mark_error(&mut self) -> &mut Self {
+        self.metadata
+            .insert(OUTBOUND_ERROR_KEY.to_string(), "true".to_string());
+        self
+    }
+
+    /// Returns `true` if this message was marked as an error via
+    /// [`Self::mark_error`].
+    pub fn is_error(&self) -> bool {
+        self.metadata.get(OUTBOUND_ERROR_KEY).map(String::as_str) == Some("true")
     }
 
     /// Sets the message ID to reply to (builder pattern).
@@ -424,5 +501,65 @@ mod tests {
             deserialized.metadata.get("discord_thread_name"),
             Some(&"ops-thread".to_string())
         );
+    }
+
+    // ---- B4-zc wire compatibility ----
+    //
+    // The `kind` field was added in B4-zc for ACP streaming. Everything
+    // that already existed must continue to serialize and deserialize
+    // unchanged: older builds must not choke on payloads from newer
+    // builds (newer payloads omit `kind` when it's `Full`), and newer
+    // builds must not choke on older payloads (missing `kind` means
+    // `Full` by default).
+
+    #[test]
+    fn outbound_default_kind_is_full() {
+        let msg = OutboundMessage::new("discord", "c1", "hi");
+        assert_eq!(msg.kind, OutboundMessageKind::Full);
+    }
+
+    #[test]
+    fn outbound_full_kind_is_omitted_from_json() {
+        // If we ever serialize `"kind":"full"` into the wire payload,
+        // older receivers without the field would also accept it (serde
+        // default kicks in), but the point is to keep the on-the-wire
+        // shape byte-identical to pre-B4-zc for the common case. Assert
+        // the `kind` key simply isn't there.
+        let msg = OutboundMessage::new("discord", "c1", "hi");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            !json.contains("\"kind\""),
+            "Full kind must not appear in serialized JSON; got: {json}"
+        );
+    }
+
+    #[test]
+    fn outbound_missing_kind_deserializes_as_full() {
+        // JSON from an older producer — no `kind` field.
+        let legacy =
+            r#"{"channel":"discord","chat_id":"c1","content":"hi","reply_to":null}"#;
+        let msg: OutboundMessage = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(msg.kind, OutboundMessageKind::Full);
+    }
+
+    #[test]
+    fn outbound_chunk_kind_roundtrips() {
+        let msg = OutboundMessage::new("acp", "sess1", "tok")
+            .with_kind(OutboundMessageKind::Chunk);
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"kind\":\"chunk\""), "json: {json}");
+        let back: OutboundMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.kind, OutboundMessageKind::Chunk);
+        assert_eq!(back.content, "tok");
+    }
+
+    #[test]
+    fn outbound_chunk_end_kind_roundtrips() {
+        let msg = OutboundMessage::new("acp", "sess1", "")
+            .with_kind(OutboundMessageKind::ChunkEnd);
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"kind\":\"chunk_end\""), "json: {json}");
+        let back: OutboundMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.kind, OutboundMessageKind::ChunkEnd);
     }
 }

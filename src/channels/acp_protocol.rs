@@ -7,6 +7,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// JSON-RPC 2.0 reserved server-error code (range -32000..-32099). We use the
+/// top of the range to surface application-level failures (e.g., LLM provider
+/// errors propagated from the agent) on in-flight `session/prompt` requests.
+pub const JSONRPC_SERVER_ERROR: i64 = -32000;
+
 /// JSON-RPC 2.0 request (method call with optional id).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -278,5 +283,35 @@ impl ContentBlock {
             block_type: "text".to_string(),
             text: Some(text.into()),
         }
+    }
+}
+
+/// Strip the `"Error: "` prefix that the agent loop prepends to outbound
+/// content for plain-text channels (Telegram, etc.). On ACP transports the
+/// failure is already represented by the JSON-RPC error envelope, so the
+/// prefix is redundant noise inside `error.message`.
+pub fn strip_agent_error_prefix(s: &str) -> &str {
+    s.strip_prefix("Error: ").unwrap_or(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_agent_error_prefix_removes_prefix_once() {
+        assert_eq!(
+            strip_agent_error_prefix("Error: Provider error: timeout"),
+            "Provider error: timeout"
+        );
+    }
+
+    #[test]
+    fn strip_agent_error_prefix_preserves_non_prefixed() {
+        assert_eq!(strip_agent_error_prefix("plain text"), "plain text");
+        // Only the literal "Error: " prefix is stripped; case/spacing variants
+        // are passed through unchanged.
+        assert_eq!(strip_agent_error_prefix("error: lower"), "error: lower");
+        assert_eq!(strip_agent_error_prefix("Error:no-space"), "Error:no-space");
     }
 }

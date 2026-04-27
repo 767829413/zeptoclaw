@@ -27,18 +27,19 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+use crate::bus::message::OutboundMessageKind;
 use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
 use crate::config::{AcpChannelConfig, AcpHttpConfig};
 use crate::error::{Result, ZeptoError};
 
 use super::acp_protocol::{
-    AgentCapabilities, AgentInfo, ContentBlock, InitializeResult, JsonRpcRequest, SessionInfo,
-    SessionListParams, SessionListResult, SessionNewResult, SessionPromptResult,
-    SessionUpdateParams, SessionUpdatePayload,
+    strip_agent_error_prefix, AgentCapabilities, AgentInfo, ContentBlock, InitializeResult,
+    JsonRpcRequest, SessionInfo, SessionListParams, SessionListResult, SessionNewResult,
+    SessionPromptResult, SessionUpdateParams, SessionUpdatePayload, JSONRPC_SERVER_ERROR,
 };
 use super::{BaseChannelConfig, Channel};
 
@@ -110,9 +111,37 @@ struct PendingPrompt {
     cancelled: bool,
 }
 
-/// Shared map from session ID to the oneshot sender that delivers the agent
-/// reply to the waiting HTTP connection handler.
-type PromptMap = Arc<Mutex<HashMap<String, oneshot::Sender<(String, bool)>>>>;
+/// One frame delivered from the bus-facing `send()` path to the SSE writer
+/// (`stream_prompt_response`). Multiple frames may flow per in-flight
+/// `session/prompt` request to support B4-zc token-level streaming.
+///
+/// Terminal variants (`Full`, `End`, `Error`) cause the writer to close the
+/// connection and clean up both `state.pending` and `pending_http`. `Chunk`
+/// is non-terminal: the writer emits an `agent_message_chunk` notification
+/// and keeps waiting for more frames.
+#[derive(Debug)]
+enum PromptFragment {
+    /// A streaming delta token. Non-terminal.
+    Chunk(String),
+    /// Complete non-streaming reply. Terminal. Writer emits a single
+    /// `agent_message` `session/update` followed by the `session/prompt`
+    /// JSON-RPC response.
+    Full { content: String, cancelled: bool },
+    /// End-of-stream marker for a reply that was already delivered via
+    /// preceding `Chunk`s. Terminal. Writer emits only the `session/prompt`
+    /// JSON-RPC response.
+    End { cancelled: bool },
+    /// Provider / runtime failure surfaced to the in-flight request as a
+    /// JSON-RPC error. Terminal.
+    Error(String),
+}
+
+/// Buffer depth for the per-prompt fragment channel. Sized generously so a
+/// bursty LLM never backpressures the bus dispatcher (token-level streams
+/// typically emit <100 deltas/s; 64 frames is ~half a second of head-room).
+const PROMPT_FRAGMENT_BUFFER: usize = 64;
+
+type PromptMap = Arc<Mutex<HashMap<String, mpsc::Sender<PromptFragment>>>>;
 
 /// A live ACP session: working directory + last-active timestamp.
 struct SessionEntry {
@@ -321,6 +350,45 @@ impl AcpHttpChannel {
         format!("data: {}\n\n", data)
     }
 
+    /// Write a `session/update` JSON-RPC notification as one SSE frame.
+    /// `session_update_kind` is the discriminator inside the update payload
+    /// (`agent_message_chunk` for streaming deltas, `agent_message` for a
+    /// non-streaming full reply). Returns `false` if the underlying TCP
+    /// write failed (caller should `break` out of its emit loop).
+    async fn write_session_update_sse(
+        stream: &mut tokio::net::TcpStream,
+        session_id: &str,
+        content: &str,
+        session_update_kind: &str,
+    ) -> bool {
+        let update = SessionUpdateParams {
+            session_id: session_id.to_string(),
+            update: SessionUpdatePayload {
+                session_update: session_update_kind.to_string(),
+                content: Some(ContentBlock::text(content)),
+                tool_call_id: None,
+                title: None,
+                kind: None,
+                status: None,
+            },
+        };
+        let Ok(update_json) = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": serde_json::to_value(&update).unwrap_or(serde_json::Value::Null)
+        })) else {
+            // Serialization can only fail for non-serializable values, which
+            // is impossible here — but skip the frame rather than abort.
+            return true;
+        };
+        let ev = Self::sse_event(&update_json);
+        if stream.write_all(ev.as_bytes()).await.is_err() {
+            return false;
+        }
+        let _ = stream.flush().await;
+        true
+    }
+
     // -------------------------------------------------------------------------
     // Protocol handler helpers (synchronous methods)
     // -------------------------------------------------------------------------
@@ -518,7 +586,7 @@ impl AcpHttpChannel {
         bus: &Arc<MessageBus>,
         id: Option<serde_json::Value>,
         params: Option<serde_json::Value>,
-    ) -> Result<std::result::Result<(String, oneshot::Receiver<(String, bool)>), String>> {
+    ) -> Result<std::result::Result<(String, mpsc::Receiver<PromptFragment>), String>> {
         if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
             return Ok(Err(Self::json_rpc_error(id, -32000, "Unauthorized")));
         }
@@ -577,16 +645,19 @@ impl AcpHttpChannel {
             st.pending
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
         }
-        let (tx, rx) = oneshot::channel::<(String, bool)>();
+        let (tx, rx) = mpsc::channel::<PromptFragment>(PROMPT_FRAGMENT_BUFFER);
         {
             pending_http.lock().await.insert(session_id.clone(), tx);
         }
+        // Tell the agent loop this transport can consume token-level
+        // streaming via OutboundMessage Chunk/ChunkEnd fragments.
         let inbound = InboundMessage::new(
             ACP_HTTP_CHANNEL_NAME,
             ACP_HTTP_SENDER_ID,
             &session_id,
             &content,
-        );
+        )
+        .with_metadata("streaming_capable", "true");
         if let Err(e) = bus.publish_inbound(inbound).await {
             // Roll back state so the session can accept a future prompt.
             state.lock().await.pending.remove(&session_id);
@@ -608,12 +679,11 @@ impl AcpHttpChannel {
         stream: &mut tokio::net::TcpStream,
         session_id: &str,
         id: Option<serde_json::Value>,
-        rx: oneshot::Receiver<(String, bool)>,
+        mut rx: mpsc::Receiver<PromptFragment>,
         state: &Arc<Mutex<AcpHttpState>>,
         pending_http: &PromptMap,
         open_cors: bool,
     ) {
-        // Keep connection alive; client reads SSE events as they arrive.
         let sse_headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}X-Accel-Buffering: no\r\n\r\n",
             cors_line(open_cors),
@@ -626,71 +696,115 @@ impl AcpHttpChannel {
         }
         let _ = stream.flush().await;
 
-        // Wait for the agent reply.
-        let (content, cancelled) =
-            match tokio::time::timeout(Duration::from_secs(PROMPT_TIMEOUT_SECS), rx).await {
-                Ok(Ok(payload)) => payload,
-                Ok(Err(_)) => {
-                    // Sender was dropped (process shutting down). Clean up
-                    // both maps so the session is not permanently stuck in
-                    // "prompt in flight" state.
-                    state.lock().await.pending.remove(session_id);
-                    pending_http.lock().await.remove(session_id);
-                    let ev =
-                        Self::sse_event(&Self::json_rpc_error(id, -32603, "agent session closed"));
+        // Consume fragments until a terminal variant is seen, the senders
+        // are dropped, or PROMPT_TIMEOUT_SECS elapses between fragments.
+        // Timeout gates each `recv()` individually so token streams with
+        // long provider-side stalls are still bounded.
+        let timeout_dur = Duration::from_secs(PROMPT_TIMEOUT_SECS);
+        loop {
+            let frag = match tokio::time::timeout(timeout_dur, rx.recv()).await {
+                Ok(Some(frag)) => frag,
+                Ok(None) => {
+                    // All senders dropped without a terminal frame, e.g.
+                    // channel stop() or abrupt shutdown. Treat as error.
+                    let ev = Self::sse_event(&Self::json_rpc_error(
+                        id.clone(),
+                        -32603,
+                        "agent session closed",
+                    ));
                     let _ = stream.write_all(ev.as_bytes()).await;
                     let _ = stream.flush().await;
-                    return;
+                    break;
                 }
                 Err(_) => {
-                    // Timeout — clean up pending state.
-                    state.lock().await.pending.remove(session_id);
-                    pending_http.lock().await.remove(session_id);
                     let ev = Self::sse_event(&Self::json_rpc_error(
-                        id,
+                        id.clone(),
                         -32603,
                         "session/prompt timed out",
                     ));
                     let _ = stream.write_all(ev.as_bytes()).await;
                     let _ = stream.flush().await;
-                    return;
+                    break;
                 }
             };
 
-        // Emit session/update notification.
-        let update = SessionUpdateParams {
-            session_id: session_id.to_string(),
-            update: SessionUpdatePayload {
-                session_update: "agent_message".to_string(),
-                content: Some(ContentBlock::text(&content)),
-                tool_call_id: None,
-                title: None,
-                kind: None,
-                status: None,
-            },
-        };
-        if let Ok(update_json) = serde_json::to_string(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": serde_json::to_value(&update).unwrap_or(serde_json::Value::Null)
-        })) {
-            let ev = Self::sse_event(&update_json);
-            if stream.write_all(ev.as_bytes()).await.is_err() {
-                return;
+            match frag {
+                PromptFragment::Chunk(content) => {
+                    // Non-terminal — emit an agent_message_chunk
+                    // notification and keep the connection open.
+                    if !Self::write_session_update_sse(
+                        stream,
+                        session_id,
+                        &content,
+                        "agent_message_chunk",
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                PromptFragment::Full { content, cancelled } => {
+                    // Single-shot reply (non-streaming agents). Emit a
+                    // full `agent_message` then the prompt response.
+                    if !Self::write_session_update_sse(
+                        stream,
+                        session_id,
+                        &content,
+                        "agent_message",
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
+                    let prompt_result = SessionPromptResult {
+                        stop_reason: stop_reason.to_string(),
+                    };
+                    if let Ok(result_val) = serde_json::to_value(&prompt_result) {
+                        let body = Self::json_rpc_result(id.clone(), result_val);
+                        let ev = Self::sse_event(&body);
+                        let _ = stream.write_all(ev.as_bytes()).await;
+                    }
+                    let _ = stream.flush().await;
+                    break;
+                }
+                PromptFragment::End { cancelled } => {
+                    // Streamed reply already delivered via preceding
+                    // Chunks — only the prompt response is left to write.
+                    let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
+                    let prompt_result = SessionPromptResult {
+                        stop_reason: stop_reason.to_string(),
+                    };
+                    if let Ok(result_val) = serde_json::to_value(&prompt_result) {
+                        let body = Self::json_rpc_result(id.clone(), result_val);
+                        let ev = Self::sse_event(&body);
+                        let _ = stream.write_all(ev.as_bytes()).await;
+                    }
+                    let _ = stream.flush().await;
+                    break;
+                }
+                PromptFragment::Error(content) => {
+                    debug!(
+                        session_id = %session_id,
+                        "ACP-HTTP: surfacing agent error as JSON-RPC error response"
+                    );
+                    let ev = Self::sse_event(&Self::json_rpc_error(
+                        id.clone(),
+                        JSONRPC_SERVER_ERROR,
+                        strip_agent_error_prefix(&content),
+                    ));
+                    let _ = stream.write_all(ev.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    break;
+                }
             }
         }
 
-        // Emit session/prompt JSON-RPC response.
-        let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
-        let prompt_result = SessionPromptResult {
-            stop_reason: stop_reason.to_string(),
-        };
-        if let Ok(result_val) = serde_json::to_value(&prompt_result) {
-            let body = Self::json_rpc_result(id, result_val);
-            let ev = Self::sse_event(&body);
-            let _ = stream.write_all(ev.as_bytes()).await;
-        }
-        let _ = stream.flush().await;
+        // Unified cleanup after loop exit (terminal frame, error, or
+        // timeout). `send()` does not touch these maps itself — exactly
+        // one cleanup path avoids double-remove races.
+        state.lock().await.pending.remove(session_id);
+        pending_http.lock().await.remove(session_id);
     }
 
     // -------------------------------------------------------------------------
@@ -1099,20 +1213,25 @@ impl Channel for AcpHttpChannel {
     /// session that originated from this channel.
     ///
     /// Looks up the waiting HTTP connection handler via `pending_http` and
-    /// delivers the content + cancellation flag through the oneshot channel.
+    /// delivers one [`PromptFragment`] per call. Multiple calls may land on
+    /// the same in-flight prompt (B4-zc token streaming); the SSE writer
+    /// side is responsible for cleaning up `state.pending` and
+    /// `pending_http` after a terminal fragment.
     async fn send(&self, msg: OutboundMessage) -> Result<()> {
         if msg.channel != ACP_HTTP_CHANNEL_NAME {
             return Ok(());
         }
         let session_id = msg.chat_id.clone();
 
-        // Check that the session is known and consume the pending prompt record.
+        // Check that the session is known and peek the cancellation flag
+        // without consuming the pending record — the SSE writer consumes
+        // it on its way out (after emitting the terminal frame).
         let (session_exists, cancelled) = {
-            let mut st = self.state.lock().await;
+            let st = self.state.lock().await;
             let exists = st.sessions.contains_key(&session_id);
             let cancelled = st
                 .pending
-                .remove(&session_id)
+                .get(&session_id)
                 .map(|p| p.cancelled)
                 .unwrap_or(false);
             (exists, cancelled)
@@ -1126,19 +1245,44 @@ impl Channel for AcpHttpChannel {
             return Ok(());
         }
 
-        // Hand the content off to the waiting HTTP handler.
-        let sender = self.pending_http.lock().await.remove(&session_id);
-        if let Some(tx) = sender {
-            // If the receiver was dropped (client disconnected) this is a no-op.
-            let _ = tx.send((msg.content, cancelled));
-        } else {
-            // Proactive message for a session that has no in-flight prompt.
-            // Nothing to do — there is no persistent connection to write to.
+        // `pending_http` holds a clone of the per-prompt mpsc sender. We
+        // clone once per call and release the lock immediately so the
+        // mutex never spans the `tx.send().await` below.
+        let sender = self
+            .pending_http
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
+        let Some(tx) = sender else {
             debug!(
                 session_id = %session_id,
-                "ACP-HTTP: proactive message with no waiting handler"
+                kind = ?msg.kind,
+                "ACP-HTTP: outbound with no waiting handler, dropping"
             );
-        }
+            return Ok(());
+        };
+
+        let fragment = if msg.is_error() {
+            PromptFragment::Error(msg.content)
+        } else {
+            match msg.kind {
+                OutboundMessageKind::Chunk => PromptFragment::Chunk(msg.content),
+                OutboundMessageKind::ChunkEnd => PromptFragment::End { cancelled },
+                OutboundMessageKind::Full => PromptFragment::Full {
+                    content: msg.content,
+                    cancelled,
+                },
+            }
+        };
+
+        // Intentional `await` (not `try_send`): dropping a Chunk would
+        // corrupt the visible reply on the client. Backpressure here is
+        // bounded by the per-prompt mpsc capacity (small, so producer
+        // pacing tracks the SSE writer's drain rate). If the receiver
+        // was dropped (client disconnected) this is a no-op; the SSE
+        // writer's cleanup path will handle state.
+        let _ = tx.send(fragment).await;
         Ok(())
     }
 
@@ -1265,6 +1409,7 @@ mod tests {
             content: "hello".to_string(),
             reply_to: None,
             metadata: Default::default(),
+            kind: Default::default(),
         };
         assert!(ch.send(msg).await.is_ok());
         // pending entry must be untouched
@@ -1284,16 +1429,17 @@ mod tests {
             content: "hello".to_string(),
             reply_to: None,
             metadata: Default::default(),
+            kind: Default::default(),
         };
         assert!(ch.send(msg).await.is_ok());
         assert!(ch.state.lock().await.sessions.is_empty());
     }
 
     #[tokio::test]
-    async fn test_send_delivers_via_oneshot() {
+    async fn test_send_delivers_full_fragment() {
         let ch = make_channel();
         let session_id = "acph_deliver".to_string();
-        let (tx, rx) = oneshot::channel::<(String, bool)>();
+        let (tx, mut rx) = mpsc::channel::<PromptFragment>(PROMPT_FRAGMENT_BUFFER);
         {
             let mut st = ch.state.lock().await;
             st.sessions.insert(
@@ -1313,20 +1459,26 @@ mod tests {
             content: "agent reply".to_string(),
             reply_to: None,
             metadata: Default::default(),
+            kind: Default::default(),
         };
         assert!(ch.send(msg).await.is_ok());
-        let (content, cancelled) = rx.await.expect("must receive payload");
-        assert_eq!(content, "agent reply");
-        assert!(!cancelled);
-        // pending entry must be consumed
-        assert!(!ch.state.lock().await.pending.contains_key(&session_id));
+        match rx.recv().await.expect("must receive fragment") {
+            PromptFragment::Full { content, cancelled } => {
+                assert_eq!(content, "agent reply");
+                assert!(!cancelled);
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+        // send() must NOT consume pending; cleanup is the writer's job.
+        assert!(ch.state.lock().await.pending.contains_key(&session_id));
+        assert!(ch.pending_http.lock().await.contains_key(&session_id));
     }
 
     #[tokio::test]
     async fn test_send_marks_cancelled() {
         let ch = make_channel();
         let session_id = "acph_cancel".to_string();
-        let (tx, rx) = oneshot::channel::<(String, bool)>();
+        let (tx, mut rx) = mpsc::channel::<PromptFragment>(PROMPT_FRAGMENT_BUFFER);
         {
             let mut st = ch.state.lock().await;
             st.sessions.insert(
@@ -1346,13 +1498,114 @@ mod tests {
             content: "reply after cancel".to_string(),
             reply_to: None,
             metadata: Default::default(),
+            kind: Default::default(),
         };
         assert!(ch.send(msg).await.is_ok());
-        let (_content, cancelled) = rx.await.expect("must receive payload");
-        assert!(
-            cancelled,
-            "cancelled flag must be forwarded to HTTP handler"
+        match rx.recv().await.expect("must receive fragment") {
+            PromptFragment::Full { cancelled, .. } => {
+                assert!(cancelled, "cancelled flag must be forwarded to HTTP handler");
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_forwards_error_flag() {
+        // When agent/loop.rs marks an outbound as an error via
+        // OutboundMessage::mark_error(), send() must surface it as a
+        // PromptFragment::Error so the SSE writer emits a JSON-RPC error
+        // response instead of a normal session/update.
+        let ch = make_channel();
+        let session_id = "acph_err".to_string();
+        let (tx, mut rx) = mpsc::channel::<PromptFragment>(PROMPT_FRAGMENT_BUFFER);
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            st.pending
+                .insert(session_id.clone(), PendingPrompt { cancelled: false });
+            ch.pending_http.lock().await.insert(session_id.clone(), tx);
+        }
+        let mut msg = OutboundMessage::new(
+            ACP_HTTP_CHANNEL_NAME,
+            &session_id,
+            "Error: Provider error: upstream connect error",
         );
+        msg.mark_error();
+        assert!(ch.send(msg).await.is_ok());
+        match rx.recv().await.expect("must receive fragment") {
+            PromptFragment::Error(content) => {
+                assert!(content.contains("upstream connect error"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_chunk_emits_chunk_fragment() {
+        // Streaming token: kind=Chunk should map to PromptFragment::Chunk
+        // and must NOT touch pending (the End fragment closes the prompt).
+        let ch = make_channel();
+        let session_id = "acph_stream".to_string();
+        let (tx, mut rx) = mpsc::channel::<PromptFragment>(PROMPT_FRAGMENT_BUFFER);
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            st.pending
+                .insert(session_id.clone(), PendingPrompt { cancelled: false });
+            ch.pending_http.lock().await.insert(session_id.clone(), tx);
+        }
+        let msg =
+            OutboundMessage::new(ACP_HTTP_CHANNEL_NAME, &session_id, "tok ").with_kind(
+                OutboundMessageKind::Chunk,
+            );
+        assert!(ch.send(msg).await.is_ok());
+        match rx.recv().await.expect("must receive fragment") {
+            PromptFragment::Chunk(content) => assert_eq!(content, "tok "),
+            other => panic!("expected Chunk, got {other:?}"),
+        }
+        assert!(ch.state.lock().await.pending.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn test_send_chunk_end_emits_end_fragment() {
+        // ChunkEnd is the stream terminator: PromptFragment::End must carry
+        // the pending cancelled flag, send() still leaves cleanup to writer.
+        let ch = make_channel();
+        let session_id = "acph_stream_end".to_string();
+        let (tx, mut rx) = mpsc::channel::<PromptFragment>(PROMPT_FRAGMENT_BUFFER);
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            st.pending
+                .insert(session_id.clone(), PendingPrompt { cancelled: true });
+            ch.pending_http.lock().await.insert(session_id.clone(), tx);
+        }
+        let msg = OutboundMessage::new(ACP_HTTP_CHANNEL_NAME, &session_id, "")
+            .with_kind(OutboundMessageKind::ChunkEnd);
+        assert!(ch.send(msg).await.is_ok());
+        match rx.recv().await.expect("must receive fragment") {
+            PromptFragment::End { cancelled } => assert!(cancelled),
+            other => panic!("expected End, got {other:?}"),
+        }
+        assert!(ch.state.lock().await.pending.contains_key(&session_id));
     }
 
     #[tokio::test]
@@ -1745,6 +1998,52 @@ mod tests {
     }
 
     /// `register_prompt` must reject calls with an unknown session ID.
+    #[tokio::test]
+    async fn test_register_prompt_marks_streaming_capable() {
+        // Regression: register_prompt must tag the published inbound with
+        // streaming_capable=true so the agent loop opts into the
+        // Chunk/ChunkEnd streaming dispatch path.
+        let ch = make_channel();
+        let session_id = "acph_stream_meta".to_string();
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+        }
+
+        let result = AcpHttpChannel::register_prompt(
+            &ch.state,
+            &ch.pending_http,
+            &ch.base_config,
+            &ch.bus,
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "hi" }],
+            })),
+        )
+        .await
+        .expect("register_prompt should succeed")
+        .expect("session should be known");
+        assert_eq!(result.0, session_id);
+
+        let inbound = ch
+            .bus
+            .consume_inbound()
+            .await
+            .expect("inbound must be published");
+        assert_eq!(
+            inbound.metadata.get("streaming_capable").map(String::as_str),
+            Some("true"),
+            "inbound must carry streaming_capable=true",
+        );
+    }
+
     #[tokio::test]
     async fn test_register_prompt_blocked_without_client_id() {
         let ch = make_channel();

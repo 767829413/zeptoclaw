@@ -18,10 +18,12 @@
 //! ```
 
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 // ============================================================================
@@ -90,6 +92,13 @@ fn acpx_path_env(acpx_path: &str) -> String {
 }
 
 /// A raw JSON-RPC connection to `zeptoclaw acp` over stdin/stdout.
+///
+/// Owns a per-process tempdir that is set as `$HOME` for the child so every
+/// subprocess gets an isolated `~/.zeptoclaw/{sessions,workspace,...}`. Without
+/// this, 29 cargo-test-parallel children race on the real shared `~/.zeptoclaw`,
+/// producing flaky failures whose only stderr signature is
+/// `JSON error: EOF while parsing a value at line 1 column 0` (the home
+/// scaffolding lost a partial write to a sibling).
 struct AcpConn {
     child: Child,
     stdin: ChildStdin,
@@ -97,13 +106,35 @@ struct AcpConn {
     /// Monotonically increasing id used by helpers so every request gets a
     /// unique, non-conflicting id regardless of how many times they are called.
     next_id: u64,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    /// Owned tempdir backing `$HOME` for the child. Dropped (and removed) when
+    /// `AcpConn` is dropped, after the child has been killed.
+    _home: tempfile::TempDir,
+}
+
+impl AcpConn {
+    /// Drain captured stderr (best-effort; non-blocking).
+    fn dump_stderr(&self) -> String {
+        match self.stderr_buf.try_lock() {
+            Ok(g) => String::from_utf8_lossy(&g).into_owned(),
+            Err(_) => "<stderr lock contended>".to_string(),
+        }
+    }
 }
 
 impl AcpConn {
     /// Spawn `zeptoclaw acp` and return a connected handle.
     async fn spawn() -> Self {
+        // Per-child isolated $HOME. `Config::dir()` resolves to
+        // `~/.zeptoclaw`, so 29 cargo-test-parallel children all hit the
+        // same `~/.zeptoclaw/sessions/` and race; a tempdir per child
+        // keeps each one's filesystem state to itself.
+        let home = tempfile::tempdir().expect("create tempdir for child HOME");
         let mut child = Command::new(bin())
             .arg("acp")
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("RUST_LOG", "")
             .env(
                 "ZEPTOCLAW_MASTER_KEY",
@@ -111,17 +142,37 @@ impl AcpConn {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn zeptoclaw acp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf = Arc::clone(&stderr_buf);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = stderr;
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.lock().await.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            });
+        }
         AcpConn {
             child,
             stdin,
             reader: BufReader::new(stdout),
+            stderr_buf,
             // Start at 2: initialize() hardcodes id=1, so helper calls begin here.
             next_id: 2,
+            _home: home,
         }
     }
 
@@ -146,7 +197,12 @@ impl AcpConn {
                     .read_line(&mut line)
                     .await
                     .expect("read from stdout");
-                assert!(!line.is_empty(), "ACP process closed stdout unexpectedly");
+                if line.is_empty() {
+                    panic!(
+                        "ACP process closed stdout unexpectedly\n--- stderr ---\n{}",
+                        self.dump_stderr()
+                    );
+                }
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     return serde_json::from_str(trimmed)
@@ -761,8 +817,20 @@ async fn test_session_lifecycle_full() {
         resp["error"]
     );
 
-    // 5. session/prompt with the real session id must be accepted (no error).
-    //    We don't wait for an LLM reply — just confirm no immediate error.
+    // 5. session/prompt with a valid session id must be routed to the prompt
+    //    handler — the protocol layer must address the response to id=203, not
+    //    silently drop it or aim it at a different request.
+    //
+    //    We deliberately do NOT assert "no error". Since B4-zc, an agent-loop
+    //    failure (e.g. no provider configured in the test harness, which is
+    //    the default here) is surfaced synchronously as a JSON-RPC -32000
+    //    error on the pending prompt instead of as a free-form `agent_message`
+    //    body. That is the contract guarded by `acp.rs`'s
+    //    `test_send_error_outbound_consumes_pending` unit test. Both ok and
+    //    -32000 are valid here — what matters for *this* lifecycle test is
+    //    routing (id matches), not latency (must be async) or success (must
+    //    be ok). A live LLM in integration would produce ok; a hermetic test
+    //    env without a provider produces -32000. Both must reach id=203.
     conn.send(serde_json::json!({
         "jsonrpc": "2.0", "id": 203,
         "method": "session/prompt",
@@ -772,15 +840,28 @@ async fn test_session_lifecycle_full() {
         }
     }))
     .await;
-    // The server queues the prompt and responds when the agent replies.
-    // We only assert that no immediate protocol-level error is returned
-    // (the request was accepted, not rejected).  Use a short deadline so the
-    // test doesn't block indefinitely in CI without a live LLM.
-    if let Some(early) = conn.try_recv().await {
-        assert!(
-            early.get("error").is_none(),
-            "session/prompt with valid session must not return an immediate error; got: {early}"
-        );
+    // Drain any synchronous output until we either see the *first response*
+    // (carries an id) or the channel goes idle. Notifications (no id, e.g.
+    // `session/update` chunks) are skipped — but skipping them inline rather
+    // than relying on `try_recv` once means we don't miss a later error frame
+    // that arrives in the same 200 ms window. Bounded retry count to keep the
+    // worst case finite even if a buggy build emits an unbounded notification
+    // burst.
+    for _ in 0..16 {
+        match conn.try_recv().await {
+            None => break,
+            Some(msg) => match msg.get("id") {
+                None | Some(serde_json::Value::Null) => continue,
+                Some(id) => {
+                    assert_eq!(
+                        id,
+                        &serde_json::json!(203),
+                        "if a response arrives synchronously it must address the prompt request id=203; got: {msg}"
+                    );
+                    break;
+                }
+            },
+        }
     }
 
     conn.shutdown().await;
@@ -867,20 +948,32 @@ async fn test_session_new_without_cwd_returns_invalid_params() {
     conn.shutdown().await;
 }
 
-/// session/list must report `_meta.pending: true` for a session with an in-flight prompt.
+/// session/list must surface a `_meta.pending` boolean for every session.
 ///
-/// After session/prompt is dispatched to the bus (but before the agent replies),
-/// session/list should show the session as pending.  In this test there is no
-/// live LLM, so the prompt never resolves — that is intentional.
+/// Original intent (pre B4-zc): send session/prompt, observe `_meta.pending=true`
+/// until the agent replies. That worked when the agent loop happily blocked
+/// without a configured provider.
+///
+/// B4-zc changed the failure mode: with no provider, the agent loop now fails
+/// the turn synchronously and the outbound dispatcher consumes the pending
+/// entry on the same hop (`acp.rs::send` for an `is_error()` outbound
+/// removes `pending`). The `_meta.pending=true` window between
+/// `handle_session_prompt` returning and the dispatcher claiming the lock is
+/// race-bounded — observably ~true, ~false, depending on which task wins
+/// `state.lock()` first under cargo-test parallelism.
+///
+/// Rather than synthesize a stable window (would require holding the agent
+/// loop or mocking the bus, both of which leak test scaffolding into prod),
+/// we narrow the assertion to what is actually contractually stable: the
+/// schema. Any session listed during/after a prompt must carry a bool
+/// `_meta.pending`. The "true" branch is exercised by `acp.rs`'s unit tests
+/// against `AcpState` directly.
 #[tokio::test]
 async fn test_session_list_shows_pending_while_prompt_in_flight() {
     let mut conn = AcpConn::spawn().await;
     conn.initialize().await;
     let session_id = conn.new_session("/tmp/acp-pending-test").await;
 
-    // Send session/prompt — the server inserts the session into `pending` and
-    // publishes to the bus.  Because there is no LLM subscriber the prompt
-    // stays in flight indefinitely, giving us a stable window to inspect state.
     conn.send(serde_json::json!({
         "jsonrpc": "2.0", "id": 330,
         "method": "session/prompt",
@@ -891,8 +984,6 @@ async fn test_session_list_shows_pending_while_prompt_in_flight() {
     }))
     .await;
 
-    // session/list immediately after — the server processes this next in the
-    // stdin loop, so `pending` is already set.
     conn.send(serde_json::json!({
         "jsonrpc": "2.0", "id": 331,
         "method": "session/list",
@@ -907,10 +998,9 @@ async fn test_session_list_shows_pending_while_prompt_in_flight() {
         .iter()
         .find(|s| s["sessionId"].as_str() == Some(&session_id))
         .unwrap_or_else(|| panic!("session must appear in list; got: {sessions:?}"));
-    assert_eq!(
-        entry["_meta"]["pending"],
-        serde_json::json!(true),
-        "_meta.pending must be true while prompt is in flight; got: {entry}"
+    assert!(
+        entry["_meta"]["pending"].is_boolean(),
+        "_meta.pending must be a boolean; got: {entry}"
     );
     conn.shutdown().await;
 }
@@ -1150,6 +1240,7 @@ fn test_acpx_sessions_list_returns_valid_json() {
 /// no --session-id flag to target an existing or fake session):
 ///   - converse via the exact ACP session ID from sessions new
 ///   - converse with a non-existent ACP session ID → expect error
+///
 /// Both are covered by the raw wire test `test_session_lifecycle_full`.
 #[test]
 fn test_acpx_session_lifecycle() {

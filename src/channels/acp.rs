@@ -13,14 +13,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
+use crate::bus::message::OutboundMessageKind;
 use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
 use crate::config::AcpChannelConfig;
 use crate::error::{Result, ZeptoError};
 
 use super::acp_protocol::{
-    AgentCapabilities, AgentInfo, ContentBlock, InitializeResult, JsonRpcRequest, JsonRpcResponse,
-    SessionInfo, SessionListParams, SessionListResult, SessionNewResult, SessionPromptResult,
-    SessionUpdateParams, SessionUpdatePayload,
+    strip_agent_error_prefix, AgentCapabilities, AgentInfo, ContentBlock, InitializeResult,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, SessionInfo, SessionListParams,
+    SessionListResult, SessionNewResult, SessionPromptResult, SessionUpdateParams,
+    SessionUpdatePayload, JSONRPC_SERVER_ERROR,
 };
 use super::{BaseChannelConfig, Channel};
 
@@ -169,7 +171,7 @@ impl AcpChannel {
                 id,
                 result: None,
                 error: Some(super::acp_protocol::JsonRpcError {
-                    code: -32000,
+                    code: JSONRPC_SERVER_ERROR,
                     message: "Unauthorized".to_string(),
                     data: None,
                 }),
@@ -262,7 +264,7 @@ impl AcpChannel {
                     id,
                     result: None,
                     error: Some(super::acp_protocol::JsonRpcError {
-                        code: -32000,
+                        code: JSONRPC_SERVER_ERROR,
                         message: format!("Too many sessions (limit: {})", MAX_ACP_SESSIONS),
                         data: None,
                     }),
@@ -308,7 +310,7 @@ impl AcpChannel {
                 id,
                 result: None,
                 error: Some(super::acp_protocol::JsonRpcError {
-                    code: -32000,
+                    code: JSONRPC_SERVER_ERROR,
                     message: "Unauthorized".to_string(),
                     data: None,
                 }),
@@ -389,7 +391,7 @@ impl AcpChannel {
                         id: id.clone(),
                         result: None,
                         error: Some(super::acp_protocol::JsonRpcError {
-                            code: -32000,
+                            code: JSONRPC_SERVER_ERROR,
                             message: format!("ACP: unknown session {}", session_id),
                             data: None,
                         }),
@@ -454,7 +456,7 @@ impl AcpChannel {
                     id: Some(req_id.clone()),
                     result: None,
                     error: Some(super::acp_protocol::JsonRpcError {
-                        code: -32000,
+                        code: JSONRPC_SERVER_ERROR,
                         message: "Unauthorized".to_string(),
                         data: None,
                     }),
@@ -517,7 +519,7 @@ impl AcpChannel {
                 id,
                 result: None,
                 error: Some(super::acp_protocol::JsonRpcError {
-                    code: -32000,
+                    code: JSONRPC_SERVER_ERROR,
                     message: "Unauthorized".to_string(),
                     data: None,
                 }),
@@ -857,6 +859,91 @@ impl AcpChannel {
         // run_stdin_loop; no need to repeat them here.
         Ok(())
     }
+
+    /// Write a single streaming token fragment as an
+    /// `agent_message_chunk` `session/update` notification. Does not
+    /// touch the pending `session/prompt` request — that is closed by a
+    /// later [`OutboundMessageKind::ChunkEnd`] (or by a fallback
+    /// `Full` reply, preserving non-streaming semantics).
+    async fn send_chunk(&self, msg: &OutboundMessage) -> Result<()> {
+        let session_id = &msg.chat_id;
+        // Session must exist, but we intentionally do not consume the
+        // pending prompt here. Refresh `last_active` so a long stream
+        // doesn't get swept as idle on the next `session/new` (sweeper
+        // is event-driven, but we still want the timestamp to reflect
+        // outbound activity, not just inbound).
+        let known = {
+            let mut state = self.state.lock().await;
+            match state.sessions.get_mut(session_id) {
+                Some(entry) => {
+                    entry.last_active = std::time::Instant::now();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !known {
+            debug!(session_id = %session_id, "ACP: chunk for unknown session, skipping");
+            return Ok(());
+        }
+        let update = SessionUpdateParams {
+            session_id: session_id.clone(),
+            update: SessionUpdatePayload {
+                session_update: "agent_message_chunk".to_string(),
+                content: Some(ContentBlock::text(&msg.content)),
+                tool_call_id: None,
+                title: None,
+                kind: None,
+                status: None,
+            },
+        };
+        let params = serde_json::to_value(&update).map_err(|e| {
+            ZeptoError::Channel(format!("ACP: serialize chunk update: {}", e))
+        })?;
+        self.write_notification("session/update", &params).await
+    }
+
+    /// Close a streaming `session/prompt` request. Carries no content —
+    /// the full reply has already been transmitted via preceding
+    /// [`OutboundMessageKind::Chunk`] messages. If there is no pending
+    /// prompt (e.g. a proactive stream), this is a silent no-op.
+    async fn send_chunk_end(&self, session_id: &str) -> Result<()> {
+        let pending = {
+            let mut state = self.state.lock().await;
+            if !state.sessions.contains_key(session_id) {
+                debug!(
+                    session_id = %session_id,
+                    "ACP: chunk_end for unknown session, skipping"
+                );
+                return Ok(());
+            }
+            state.pending.remove(session_id)
+        };
+        let Some(pending) = pending else {
+            debug!(
+                session_id = %session_id,
+                "ACP: chunk_end without pending, nothing to close"
+            );
+            return Ok(());
+        };
+        let stop_reason = if pending.cancelled {
+            "cancelled"
+        } else {
+            "end_turn"
+        };
+        let result = SessionPromptResult {
+            stop_reason: stop_reason.to_string(),
+        };
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(pending.request_id),
+            result: Some(serde_json::to_value(result).map_err(|e| {
+                ZeptoError::Channel(format!("ACP: serialize prompt result: {}", e))
+            })?),
+            error: None,
+        };
+        self.write_response(&response).await
+    }
 }
 
 #[async_trait]
@@ -908,6 +995,21 @@ impl Channel for AcpChannel {
         if msg.channel != ACP_CHANNEL_NAME {
             return Ok(());
         }
+
+        // B4-zc streaming paths. `Chunk` writes an `agent_message_chunk`
+        // notification without touching the pending prompt — the prompt
+        // is held open until a later `ChunkEnd` (or a fallback `Full`)
+        // closes it. `ChunkEnd` only closes the prompt and carries no
+        // content. `Full` preserves the original single-shot semantics
+        // verbatim so the 17 existing acp.rs tests do not regress.
+        match msg.kind {
+            OutboundMessageKind::Chunk => return self.send_chunk(&msg).await,
+            OutboundMessageKind::ChunkEnd => {
+                return self.send_chunk_end(&msg.chat_id).await;
+            }
+            OutboundMessageKind::Full => {}
+        }
+
         let session_id = msg.chat_id.clone();
         let (pending, session_exists) = {
             let mut state = self.state.lock().await;
@@ -918,6 +1020,36 @@ impl Channel for AcpChannel {
             debug!(session_id = %session_id, "ACP: outbound for unknown session, skipping");
             return Ok(());
         }
+
+        // Error outbound: surface as JSON-RPC error on the pending prompt
+        // instead of masquerading as a normal assistant reply. This preserves
+        // the ACP protocol contract so downstream schedulers can classify
+        // provider/runtime failures without string-matching the reply body.
+        //
+        // Falls back to the normal agent_message path when there is no
+        // pending prompt (proactive notifications have no request to fail).
+        if msg.is_error() {
+            if let Some(pending) = pending {
+                let response = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(pending.request_id),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: JSONRPC_SERVER_ERROR,
+                        message: strip_agent_error_prefix(&msg.content).to_string(),
+                        data: None,
+                    }),
+                };
+                debug!(
+                    session_id = %session_id,
+                    "ACP: surfacing agent error as JSON-RPC error response"
+                );
+                return self.write_response(&response).await;
+            }
+            // No pending prompt: fall through to proactive agent_message so
+            // the user at least sees the error text via the normal channel.
+        }
+
         // session/update (agent_message) — sent for both prompted and proactive replies
         let update = SessionUpdateParams {
             session_id: session_id.clone(),
@@ -973,6 +1105,77 @@ mod tests {
     use crate::config::AcpChannelConfig;
 
     #[tokio::test]
+    async fn test_send_error_outbound_consumes_pending() {
+        // An outbound flagged with metadata["error"]="true" must take the
+        // JSON-RPC error path: the pending prompt is consumed (replied to
+        // with a JSON-RPC error) and the session is preserved for follow-ups.
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let session_id = "acp_err_session".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            state.pending.insert(
+                session_id.clone(),
+                PendingPrompt {
+                    request_id: serde_json::json!(42),
+                    cancelled: false,
+                },
+            );
+        }
+        let mut msg = OutboundMessage::new(
+            "acp",
+            &session_id,
+            "Error: Provider error: Server error: upstream timeout",
+        );
+        msg.mark_error();
+        let result = channel.send(msg).await;
+        assert!(result.is_ok(), "error send must succeed: {:?}", result);
+        let state = channel.state.lock().await;
+        assert!(
+            !state.pending.contains_key(&session_id),
+            "error send must consume the pending prompt"
+        );
+        assert!(
+            state.sessions.contains_key(&session_id),
+            "error send must not drop the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_error_outbound_without_pending_falls_back() {
+        // Proactive error (no pending prompt) should fall through to the
+        // normal session/update path without panicking.
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let session_id = "acp_err_no_pending".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+        }
+        let mut msg = OutboundMessage::new("acp", &session_id, "proactive failure");
+        msg.mark_error();
+        let result = channel.send(msg).await;
+        assert!(result.is_ok(), "proactive error send must succeed");
+    }
+
+    #[tokio::test]
     async fn test_send_ignores_wrong_channel() {
         // send() with a channel other than "acp" must be a no-op: the pending
         // prompt must not be consumed and the session must remain intact.
@@ -1004,6 +1207,7 @@ mod tests {
             content: "hello".to_string(),
             reply_to: None,
             metadata: Default::default(),
+            kind: Default::default(),
         };
         let result = channel.send(msg).await;
         assert!(result.is_ok());
@@ -1278,6 +1482,7 @@ mod tests {
             content: "hello".to_string(),
             reply_to: None,
             metadata: Default::default(),
+            kind: Default::default(),
         };
         let result = channel.send(msg).await;
         assert!(result.is_ok());
@@ -1313,6 +1518,7 @@ mod tests {
             content: "proactive message".to_string(),
             reply_to: None,
             metadata: Default::default(),
+            kind: Default::default(),
         };
         let result = channel.send(msg).await;
         assert!(result.is_ok());
@@ -1422,5 +1628,122 @@ mod tests {
         let pending_b = sessions.iter().find(|(s, _)| s == &sid_b).map(|(_, p)| *p);
         assert_eq!(pending_a, Some(true), "sid_a must be pending");
         assert_eq!(pending_b, Some(false), "sid_b must not be pending");
+    }
+
+    // ---- B4-zc streaming state machine ----
+    //
+    // Chunk must leave the pending prompt intact so a later ChunkEnd
+    // (or a fallback Full) can close the JSON-RPC request. ChunkEnd
+    // consumes the pending entry and must be a no-op when none exists.
+
+    #[tokio::test]
+    async fn send_chunk_does_not_consume_pending() {
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let session_id = "acp_stream_keep".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            state.pending.insert(
+                session_id.clone(),
+                PendingPrompt {
+                    request_id: serde_json::json!(7),
+                    cancelled: false,
+                },
+            );
+        }
+        let msg = OutboundMessage::new(ACP_CHANNEL_NAME, &session_id, "hel")
+            .with_kind(OutboundMessageKind::Chunk);
+        assert!(channel.send(msg).await.is_ok());
+        let state = channel.state.lock().await;
+        assert!(
+            state.pending.contains_key(&session_id),
+            "Chunk must leave the pending prompt untouched"
+        );
+        assert!(state.sessions.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn send_chunk_end_closes_pending() {
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let session_id = "acp_stream_close".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            state.pending.insert(
+                session_id.clone(),
+                PendingPrompt {
+                    request_id: serde_json::json!(9),
+                    cancelled: false,
+                },
+            );
+        }
+        let msg = OutboundMessage::new(ACP_CHANNEL_NAME, &session_id, "")
+            .with_kind(OutboundMessageKind::ChunkEnd);
+        assert!(channel.send(msg).await.is_ok());
+        let state = channel.state.lock().await;
+        assert!(
+            !state.pending.contains_key(&session_id),
+            "ChunkEnd must consume the pending prompt"
+        );
+        assert!(
+            state.sessions.contains_key(&session_id),
+            "ChunkEnd must preserve the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_chunk_end_without_pending_is_noop() {
+        // Proactive stream with no pending prompt. Must not panic and must
+        // leave state unchanged.
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let session_id = "acp_stream_noop".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+        }
+        let msg = OutboundMessage::new(ACP_CHANNEL_NAME, &session_id, "")
+            .with_kind(OutboundMessageKind::ChunkEnd);
+        assert!(channel.send(msg).await.is_ok());
+        let state = channel.state.lock().await;
+        assert!(state.sessions.contains_key(&session_id));
+        assert!(!state.pending.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn send_chunk_unknown_session_is_noop() {
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let msg = OutboundMessage::new(ACP_CHANNEL_NAME, "acp_ghost", "hi")
+            .with_kind(OutboundMessageKind::Chunk);
+        assert!(channel.send(msg).await.is_ok());
     }
 }

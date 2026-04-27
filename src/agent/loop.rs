@@ -49,6 +49,17 @@ const MAX_IMAGE_SIZE: usize = 20 * 1024 * 1024; // 20MB
 
 const INTERACTIVE_CLI_METADATA_KEY: &str = "interactive_cli";
 const TRUSTED_LOCAL_SESSION_METADATA_KEY: &str = "trusted_local_session";
+/// Inbound metadata flag set by streaming-capable transports (e.g. ACP-HTTP)
+/// to opt the response path into token-level streaming via `OutboundMessage`
+/// `Chunk`/`ChunkEnd` fragments. Channels that do not set this flag receive
+/// the legacy single `Full` reply.
+const STREAMING_CAPABLE_METADATA_KEY: &str = "streaming_capable";
+
+fn is_streaming_capable(msg: &InboundMessage) -> bool {
+    msg.metadata
+        .get(STREAMING_CAPABLE_METADATA_KEY)
+        .is_some_and(|v| v == "true")
+}
 
 type ApprovalFuture = Pin<Box<dyn Future<Output = ApprovalResponse> + Send>>;
 type ApprovalHandler = Arc<dyn Fn(ApprovalRequest) -> ApprovalFuture + Send + Sync>;
@@ -3111,11 +3122,26 @@ impl AgentLoop {
         }
     }
 
+    /// Decide whether to dispatch to the streaming path. Both conditions
+    /// must hold: the inbound transport opted in (via `streaming_capable`
+    /// metadata) AND provider-level streaming is enabled at runtime.
+    /// Pulled out as a method so the dispatch decision is unit-testable
+    /// without standing up the full `process_inbound_message` chain.
+    fn should_stream(&self, msg: &InboundMessage) -> bool {
+        is_streaming_capable(msg) && self.streaming.load(Ordering::SeqCst)
+    }
+
     async fn process_inbound_message(
         &self,
         msg: &InboundMessage,
         usage_metrics: Option<Arc<UsageMetrics>>,
     ) {
+        if self.should_stream(msg) {
+            self.process_inbound_message_streaming(msg, usage_metrics)
+                .await;
+            return;
+        }
+
         info!("Processing message");
         let start = std::time::Instant::now();
         let tokens_before = Self::token_snapshot(usage_metrics.as_ref());
@@ -3162,6 +3188,10 @@ impl AgentLoop {
 
                 let mut error_msg =
                     OutboundMessage::new(&msg.channel, &msg.chat_id, &format!("Error: {}", e));
+                // Flag so error-aware channels (e.g. ACP) can surface this as
+                // a protocol-level error instead of a normal assistant reply.
+                // Other channels ignore the flag and render the text as usual.
+                error_msg.mark_error();
                 propagate_routing_metadata(&mut error_msg, msg);
                 self.bus.publish_outbound(error_msg).await.ok();
                 false
@@ -3191,6 +3221,163 @@ impl AgentLoop {
         let slo = crate::utils::slo::SessionSLO::evaluate(&self.metrics_collector, agent_completed);
         slo.emit();
         debug!(slo_summary = %slo.summary(), "Session SLO summary");
+
+        self.drain_pending_messages(msg).await;
+    }
+
+    /// Streaming-capable variant of `process_inbound_message`.
+    ///
+    /// Selected when the inbound carries `streaming_capable=true` metadata
+    /// AND provider-level streaming is enabled. Translates `StreamEvent`s
+    /// into `OutboundMessage` fragments:
+    /// - `Delta(text)` → `Chunk(text)` (forwarded as `agent_message_chunk`)
+    /// - `Done {content}` (after deltas) → `ChunkEnd` (closes the prompt
+    ///   without re-sending content)
+    /// - `Done {content}` (no prior deltas, e.g. provider degraded to
+    ///   non-streaming) → single `Full(content)` so non-streaming channels
+    ///   still work unchanged
+    /// - `Error(e)` → `Full` with `mark_error()`, surfaced as a JSON-RPC
+    ///   error by error-aware channels
+    async fn process_inbound_message_streaming(
+        &self,
+        msg: &InboundMessage,
+        usage_metrics: Option<Arc<UsageMetrics>>,
+    ) {
+        use crate::bus::message::OutboundMessageKind;
+        use crate::providers::StreamEvent;
+
+        info!("Processing message (streaming)");
+        let start = std::time::Instant::now();
+        let tokens_before = Self::token_snapshot(usage_metrics.as_ref());
+
+        if let Some(metrics) = usage_metrics.as_ref() {
+            metrics.record_request();
+        }
+
+        let timeout_duration =
+            std::time::Duration::from_secs(self.config.agents.defaults.agent_timeout_secs);
+
+        let stream_result = tokio::time::timeout(timeout_duration, async {
+            let mut rx = self.process_message_streaming(msg).await?;
+            let mut had_delta = false;
+            let mut final_content = String::new();
+
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Delta(text) => {
+                        had_delta = true;
+                        let mut chunk =
+                            OutboundMessage::new(&msg.channel, &msg.chat_id, &text)
+                                .with_kind(OutboundMessageKind::Chunk);
+                        propagate_routing_metadata(&mut chunk, msg);
+                        if let Err(e) = self.bus.publish_outbound(chunk).await {
+                            error!("Failed to publish chunk: {}", e);
+                        }
+                    }
+                    StreamEvent::Done { content, .. } => {
+                        final_content = content;
+                        break;
+                    }
+                    StreamEvent::ToolCalls(_) => {
+                        // Streaming path is the FINAL call; tool calls
+                        // here are a provider contract violation. Surface
+                        // as an error so the outer arm marks it on the
+                        // OutboundMessage (mark_error) — silently breaking
+                        // would emit a normal ChunkEnd and be read as a
+                        // successful end_turn by the client.
+                        warn!("Unexpected ToolCalls mid-stream; failing turn");
+                        return Err(ZeptoError::Provider(
+                            "unexpected tool calls in final streaming call".to_string(),
+                        ));
+                    }
+                    StreamEvent::Error(e) => return Err(e),
+                }
+            }
+
+            Ok::<(bool, String), ZeptoError>((had_delta, final_content))
+        })
+        .await;
+
+        let agent_completed = match stream_result {
+            Ok(Ok((had_delta, final_content))) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let (input_tokens, output_tokens) =
+                    Self::token_delta(usage_metrics.as_ref(), tokens_before);
+
+                info!(
+                    latency_ms = latency_ms,
+                    response_len = final_content.len(),
+                    input_tokens = input_tokens,
+                    output_tokens = output_tokens,
+                    streamed = had_delta,
+                    "Request completed (streaming)"
+                );
+
+                if had_delta {
+                    let mut end = OutboundMessage::new(&msg.channel, &msg.chat_id, "")
+                        .with_kind(OutboundMessageKind::ChunkEnd);
+                    propagate_routing_metadata(&mut end, msg);
+                    if let Err(e) = self.bus.publish_outbound(end).await {
+                        error!("Failed to publish chunk-end: {}", e);
+                    }
+                } else {
+                    let mut full =
+                        OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
+                    propagate_routing_metadata(&mut full, msg);
+                    if let Err(e) = self.bus.publish_outbound(full).await {
+                        error!("Failed to publish full reply: {}", e);
+                    }
+                }
+                true
+            }
+            Ok(Err(e)) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                error!(latency_ms = latency_ms, error = %e, "Streaming request failed");
+                if let Some(metrics) = usage_metrics.as_ref() {
+                    metrics.record_error();
+                }
+
+                let mut err_msg = OutboundMessage::new(
+                    &msg.channel,
+                    &msg.chat_id,
+                    &format!("Error: {}", e),
+                );
+                err_msg.mark_error();
+                propagate_routing_metadata(&mut err_msg, msg);
+                self.bus.publish_outbound(err_msg).await.ok();
+                false
+            }
+            Err(_elapsed) => {
+                let timeout_secs = self.config.agents.defaults.agent_timeout_secs;
+                error!(timeout_secs = timeout_secs, "Streaming agent run timed out");
+                if let Some(metrics) = usage_metrics.as_ref() {
+                    metrics.record_error();
+                }
+
+                // Note: we send only a single `Full` (with mark_error), not
+                // a separate `ChunkEnd`. Streaming-aware channels treat any
+                // `mark_error()` outbound as terminal and run their own
+                // cleanup (close the prompt, surface as a JSON-RPC error).
+                // Sending ChunkEnd first would race the error frame.
+                let mut timeout_msg = OutboundMessage::new(
+                    &msg.channel,
+                    &msg.chat_id,
+                    &format!(
+                        "Agent run timed out after {}s. Try a simpler request.",
+                        timeout_secs
+                    ),
+                );
+                timeout_msg.mark_error();
+                propagate_routing_metadata(&mut timeout_msg, msg);
+                self.bus.publish_outbound(timeout_msg).await.ok();
+                false
+            }
+        };
+
+        let slo =
+            crate::utils::slo::SessionSLO::evaluate(&self.metrics_collector, agent_completed);
+        slo.emit();
+        debug!(slo_summary = %slo.summary(), "Session SLO summary (streaming)");
 
         self.drain_pending_messages(msg).await;
     }
@@ -4162,6 +4349,34 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let agent = AgentLoop::new(config, session_manager, bus);
         assert!(agent.is_streaming());
+    }
+
+    #[tokio::test]
+    async fn test_should_stream_requires_metadata_and_runtime_flag() {
+        let mut config = Config::default();
+        config.agents.defaults.streaming = true;
+        let session_manager = SessionManager::new_memory();
+        let bus = Arc::new(MessageBus::new());
+        let agent = AgentLoop::new(config, session_manager, bus);
+
+        // No metadata => never streams, even if runtime flag is on.
+        let plain = InboundMessage::new("acp_http", "u1", "c1", "hi");
+        assert!(!agent.should_stream(&plain));
+
+        // Metadata set => streams when runtime flag is on.
+        let capable = InboundMessage::new("acp_http", "u1", "c1", "hi")
+            .with_metadata(STREAMING_CAPABLE_METADATA_KEY, "true");
+        assert!(agent.should_stream(&capable));
+
+        // Runtime flag off => never streams, even with metadata.
+        agent.set_streaming(false);
+        assert!(!agent.should_stream(&capable));
+
+        // Wrong metadata value => never streams.
+        agent.set_streaming(true);
+        let mistyped = InboundMessage::new("acp_http", "u1", "c1", "hi")
+            .with_metadata(STREAMING_CAPABLE_METADATA_KEY, "yes");
+        assert!(!agent.should_stream(&mistyped));
     }
 
     #[test]

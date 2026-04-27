@@ -304,6 +304,30 @@ pub(crate) async fn create_agent_with_template(
         }
     }
 
+    // Load AGENTS.md from workspace — single source of truth for cross-agent
+    // behavior (Output Discipline, Identity, Safety, Memory Strategy, …).
+    // Must come after `with_system_prompt()` so it isn't dropped by the
+    // template/hand override path. Loaded before TOOLS.md so tool-specific
+    // rules in TOOLS.md sit closest to the end of the prompt.
+    let agents_path = config.workspace_path().join("AGENTS.md");
+    if agents_path.is_file() {
+        match std::fs::read_to_string(&agents_path) {
+            Ok(content) => {
+                let content = content.trim();
+                if !content.is_empty() {
+                    context_builder =
+                        context_builder.with_system_prompt_suffix(&format!("\n\n{}", content));
+                    info!("Loaded AGENTS.md from {}", agents_path.display());
+                }
+            }
+            Err(e) => warn!(
+                "Failed to read AGENTS.md at {}: {}",
+                agents_path.display(),
+                e
+            ),
+        }
+    }
+
     // Load TOOLS.md from workspace — must come after with_system_prompt() to survive override
     let tools_path = config.workspace_path().join("TOOLS.md");
     if tools_path.is_file() {
