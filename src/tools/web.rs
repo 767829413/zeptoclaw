@@ -216,10 +216,7 @@ impl Tool for WebSearchTool {
             output.push('\n');
         }
 
-        Ok(ToolOutput::split(
-            output.trim_end().to_string(),
-            "Searching (Brave)...",
-        ))
+        Ok(ToolOutput::llm_only(output.trim_end().to_string()))
     }
 }
 
@@ -396,10 +393,7 @@ impl Tool for DdgSearchTool {
             output.push('\n');
         }
 
-        Ok(ToolOutput::split(
-            output.trim_end().to_string(),
-            "Searching (DuckDuckGo)...",
-        ))
+        Ok(ToolOutput::llm_only(output.trim_end().to_string()))
     }
 }
 
@@ -573,10 +567,7 @@ impl Tool for SearxngSearchTool {
             output.push('\n');
         }
 
-        Ok(ToolOutput::split(
-            output.trim_end().to_string(),
-            "Searching (SearXNG)...",
-        ))
+        Ok(ToolOutput::llm_only(output.trim_end().to_string()))
     }
 }
 

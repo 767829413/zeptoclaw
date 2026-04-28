@@ -1002,10 +1002,23 @@ impl Channel for AcpChannel {
         // closes it. `ChunkEnd` only closes the prompt and carries no
         // content. `Full` preserves the original single-shot semantics
         // verbatim so the 17 existing acp.rs tests do not regress.
+        // Tool `for_user` keep-typing status messages (e.g.
+        // `searxng_search` emitting "Searching (SearXNG)...") arrive as
+        // kind=Full with metadata `keep_typing=true`. They are intermediate
+        // progress strings, not the turn's final reply — route them
+        // through `send_chunk` so we emit an `agent_message_chunk` update
+        // without closing the pending prompt. Mirrors acp_http.rs::send().
+        let keep_typing = msg
+            .metadata
+            .get("keep_typing")
+            .is_some_and(|v| v == "true");
         match msg.kind {
             OutboundMessageKind::Chunk => return self.send_chunk(&msg).await,
             OutboundMessageKind::ChunkEnd => {
                 return self.send_chunk_end(&msg.chat_id).await;
+            }
+            OutboundMessageKind::Full if keep_typing => {
+                return self.send_chunk(&msg).await;
             }
             OutboundMessageKind::Full => {}
         }

@@ -1266,9 +1266,25 @@ impl Channel for AcpHttpChannel {
         let fragment = if msg.is_error() {
             PromptFragment::Error(msg.content)
         } else {
+            // Tools that emit a `for_user` keep-typing status (e.g.
+            // `searxng_search` returning `ToolOutput::split(real_results,
+            // "Searching (SearXNG)...")`) reach us as kind=Full with
+            // metadata `keep_typing=true`. They are intermediate progress
+            // strings, not the turn's final reply — route them as Chunk so
+            // the SSE writer emits an `agent_message_chunk` notification
+            // without closing the pending prompt. Without this remap the
+            // first such status string ends the turn early and the LLM's
+            // real reply lands on a closed pending_http and gets dropped.
+            let keep_typing = msg
+                .metadata
+                .get("keep_typing")
+                .is_some_and(|v| v == "true");
             match msg.kind {
                 OutboundMessageKind::Chunk => PromptFragment::Chunk(msg.content),
                 OutboundMessageKind::ChunkEnd => PromptFragment::End { cancelled },
+                OutboundMessageKind::Full if keep_typing => {
+                    PromptFragment::Chunk(msg.content)
+                }
                 OutboundMessageKind::Full => PromptFragment::Full {
                     content: msg.content,
                     cancelled,
