@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
-use crate::bus::message::OutboundMessageKind;
+use crate::bus::message::{OutboundMessageKind, OUTBOUND_CUSTOM_SUMMARY_KEY};
 use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
 use crate::config::AcpChannelConfig;
 use crate::error::{Result, ZeptoError};
@@ -895,11 +895,12 @@ impl AcpChannel {
                 title: None,
                 kind: None,
                 status: None,
+                custom_name: None,
+                custom_payload: None,
             },
         };
-        let params = serde_json::to_value(&update).map_err(|e| {
-            ZeptoError::Channel(format!("ACP: serialize chunk update: {}", e))
-        })?;
+        let params = serde_json::to_value(&update)
+            .map_err(|e| ZeptoError::Channel(format!("ACP: serialize chunk update: {}", e)))?;
         self.write_notification("session/update", &params).await
     }
 
@@ -1008,14 +1009,24 @@ impl Channel for AcpChannel {
         // progress strings, not the turn's final reply — route them
         // through `send_chunk` so we emit an `agent_message_chunk` update
         // without closing the pending prompt. Mirrors acp_http.rs::send().
-        let keep_typing = msg
-            .metadata
-            .get("keep_typing")
-            .is_some_and(|v| v == "true");
+        let keep_typing = msg.metadata.get("keep_typing").is_some_and(|v| v == "true");
         match msg.kind {
             OutboundMessageKind::Chunk => return self.send_chunk(&msg).await,
             OutboundMessageKind::ChunkEnd => {
                 return self.send_chunk_end(&msg.chat_id).await;
+            }
+            OutboundMessageKind::Custom => {
+                // stdio ACP clients that don't understand custom structured
+                // updates still get a textual fallback summary as a chunk.
+                let Some(summary) = msg.metadata.get(OUTBOUND_CUSTOM_SUMMARY_KEY).cloned() else {
+                    return Ok(());
+                };
+                if summary.is_empty() {
+                    return Ok(());
+                }
+                let fallback = OutboundMessage::new(ACP_CHANNEL_NAME, &msg.chat_id, &summary)
+                    .with_kind(OutboundMessageKind::Chunk);
+                return self.send_chunk(&fallback).await;
             }
             OutboundMessageKind::Full if keep_typing => {
                 return self.send_chunk(&msg).await;
@@ -1073,6 +1084,8 @@ impl Channel for AcpChannel {
                 title: None,
                 kind: None,
                 status: None,
+                custom_name: None,
+                custom_payload: None,
             },
         };
         let params = serde_json::to_value(&update)
@@ -1747,6 +1760,41 @@ mod tests {
         let state = channel.state.lock().await;
         assert!(state.sessions.contains_key(&session_id));
         assert!(!state.pending.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn send_custom_with_summary_falls_back_to_chunk() {
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let session_id = "acp_custom_fallback".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            state.pending.insert(
+                session_id.clone(),
+                PendingPrompt {
+                    request_id: serde_json::json!(11),
+                    cancelled: false,
+                },
+            );
+        }
+        let msg = OutboundMessage::new(ACP_CHANNEL_NAME, &session_id, "")
+            .with_kind(OutboundMessageKind::Custom)
+            .with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, "approval required");
+        assert!(channel.send(msg).await.is_ok());
+        let state = channel.state.lock().await;
+        assert!(
+            state.pending.contains_key(&session_id),
+            "custom summary fallback must not close pending prompt"
+        );
     }
 
     #[tokio::test]

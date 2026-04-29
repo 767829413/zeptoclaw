@@ -25,13 +25,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-use crate::bus::message::OutboundMessageKind;
+use crate::bus::message::{
+    OutboundMessageKind, OUTBOUND_CUSTOM_NAME_KEY, OUTBOUND_CUSTOM_PAYLOAD_KEY,
+};
 use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
 use crate::config::{AcpChannelConfig, AcpHttpConfig};
 use crate::error::{Result, ZeptoError};
@@ -134,6 +137,12 @@ enum PromptFragment {
     /// Provider / runtime failure surfaced to the in-flight request as a
     /// JSON-RPC error. Terminal.
     Error(String),
+    /// Structured custom event emitted as `session/update(agent_custom)`.
+    /// Non-terminal.
+    Custom {
+        name: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// Buffer depth for the per-prompt fragment channel. Sized generously so a
@@ -189,6 +198,15 @@ struct ParsedRequest {
     path: String,
     headers: Vec<(String, String)>,
     body: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectInboundParams {
+    session_id: String,
+    content: String,
+    kind: String,
+    request_id: String,
 }
 
 // --- Channel struct ---
@@ -370,6 +388,8 @@ impl AcpHttpChannel {
                 title: None,
                 kind: None,
                 status: None,
+                custom_name: None,
+                custom_payload: None,
             },
         };
         let Ok(update_json) = serde_json::to_string(&serde_json::json!({
@@ -379,6 +399,42 @@ impl AcpHttpChannel {
         })) else {
             // Serialization can only fail for non-serializable values, which
             // is impossible here — but skip the frame rather than abort.
+            return true;
+        };
+        let ev = Self::sse_event(&update_json);
+        if stream.write_all(ev.as_bytes()).await.is_err() {
+            return false;
+        }
+        let _ = stream.flush().await;
+        true
+    }
+
+    /// Write a custom structured `session/update` notification as one SSE
+    /// frame. Returns `false` on write failure.
+    async fn write_custom_session_update_sse(
+        stream: &mut tokio::net::TcpStream,
+        session_id: &str,
+        name: &str,
+        payload: &serde_json::Value,
+    ) -> bool {
+        let update = SessionUpdateParams {
+            session_id: session_id.to_string(),
+            update: SessionUpdatePayload {
+                session_update: "agent_custom".to_string(),
+                content: None,
+                tool_call_id: None,
+                title: None,
+                kind: None,
+                status: None,
+                custom_name: Some(name.to_string()),
+                custom_payload: Some(payload.clone()),
+            },
+        };
+        let Ok(update_json) = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": serde_json::to_value(&update).unwrap_or(serde_json::Value::Null)
+        })) else {
             return true;
         };
         let ev = Self::sse_event(&update_json);
@@ -518,6 +574,68 @@ impl AcpHttpChannel {
             }
         }
         Self::json_rpc_result(id, serde_json::json!({}))
+    }
+
+    /// Handle x.openshell/inject_inbound: publish a synthetic inbound message
+    /// into an existing ACP session without opening a `session/prompt`.
+    async fn do_inject_inbound(
+        state: &Arc<Mutex<AcpHttpState>>,
+        base_config: &BaseChannelConfig,
+        bus: &Arc<MessageBus>,
+        id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
+    ) -> String {
+        if !base_config.is_allowed(ACP_HTTP_SENDER_ID) {
+            return Self::json_rpc_error(id, -32000, "Unauthorized");
+        }
+        let params =
+            match params.and_then(|p| serde_json::from_value::<InjectInboundParams>(p).ok()) {
+                Some(p) => p,
+                None => {
+                    return Self::json_rpc_error(
+                        id,
+                        -32602,
+                        "x.openshell/inject_inbound: missing or invalid params",
+                    )
+                }
+            };
+        if params.session_id.is_empty() || params.kind.is_empty() || params.request_id.is_empty() {
+            return Self::json_rpc_error(
+                id,
+                -32602,
+                "x.openshell/inject_inbound: sessionId/kind/requestId are required",
+            );
+        }
+        {
+            let mut st = state.lock().await;
+            let Some(entry) = st.sessions.get_mut(&params.session_id) else {
+                return Self::json_rpc_error(
+                    id,
+                    JSONRPC_SERVER_ERROR,
+                    &format!("ACP: unknown session {}", params.session_id),
+                );
+            };
+            entry.last_active = std::time::Instant::now();
+        }
+        let inbound = InboundMessage::new(
+            ACP_HTTP_CHANNEL_NAME,
+            ACP_HTTP_SENDER_ID,
+            &params.session_id,
+            &params.content,
+        )
+        .with_metadata("inject_kind", &params.kind)
+        .with_metadata("request_id", &params.request_id);
+        let delivered = match bus.publish_inbound_with_status(inbound).await {
+            Ok(intercepted) => intercepted,
+            Err(e) => {
+                return Self::json_rpc_error(
+                    id,
+                    -32603,
+                    &format!("x.openshell/inject_inbound: publish failed: {}", e),
+                )
+            }
+        };
+        Self::json_rpc_result(id, serde_json::json!({ "delivered": delivered }))
     }
 
     /// Handle session/list: return all live sessions with per-session metadata.
@@ -739,6 +857,13 @@ impl AcpHttpChannel {
                         "agent_message_chunk",
                     )
                     .await
+                    {
+                        break;
+                    }
+                }
+                PromptFragment::Custom { name, payload } => {
+                    if !Self::write_custom_session_update_sse(stream, session_id, &name, &payload)
+                        .await
                     {
                         break;
                     }
@@ -1001,6 +1126,11 @@ impl AcpHttpChannel {
                 let resp = Self::http_200(&body, open_cors);
                 let _ = stream.write_all(resp.as_bytes()).await;
             }
+            "x.openshell/inject_inbound" => {
+                let body = Self::do_inject_inbound(&state, &base_config, &bus, id, params).await;
+                let resp = Self::http_200(&body, open_cors);
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
             "session/prompt" => {
                 match Self::register_prompt(
                     &state,
@@ -1248,12 +1378,7 @@ impl Channel for AcpHttpChannel {
         // `pending_http` holds a clone of the per-prompt mpsc sender. We
         // clone once per call and release the lock immediately so the
         // mutex never spans the `tx.send().await` below.
-        let sender = self
-            .pending_http
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned();
+        let sender = self.pending_http.lock().await.get(&session_id).cloned();
         let Some(tx) = sender else {
             debug!(
                 session_id = %session_id,
@@ -1275,16 +1400,29 @@ impl Channel for AcpHttpChannel {
             // without closing the pending prompt. Without this remap the
             // first such status string ends the turn early and the LLM's
             // real reply lands on a closed pending_http and gets dropped.
-            let keep_typing = msg
-                .metadata
-                .get("keep_typing")
-                .is_some_and(|v| v == "true");
+            let keep_typing = msg.metadata.get("keep_typing").is_some_and(|v| v == "true");
             match msg.kind {
                 OutboundMessageKind::Chunk => PromptFragment::Chunk(msg.content),
                 OutboundMessageKind::ChunkEnd => PromptFragment::End { cancelled },
-                OutboundMessageKind::Full if keep_typing => {
-                    PromptFragment::Chunk(msg.content)
+                OutboundMessageKind::Custom => {
+                    let Some(name) = msg.metadata.get(OUTBOUND_CUSTOM_NAME_KEY).cloned() else {
+                        debug!("ACP-HTTP: custom outbound missing custom.name, dropping");
+                        return Ok(());
+                    };
+                    let Some(raw_payload) = msg.metadata.get(OUTBOUND_CUSTOM_PAYLOAD_KEY) else {
+                        debug!("ACP-HTTP: custom outbound missing custom.payload, dropping");
+                        return Ok(());
+                    };
+                    let payload: serde_json::Value = match serde_json::from_str(raw_payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            debug!(error = %e, "ACP-HTTP: invalid custom.payload JSON, dropping");
+                            return Ok(());
+                        }
+                    };
+                    PromptFragment::Custom { name, payload }
                 }
+                OutboundMessageKind::Full if keep_typing => PromptFragment::Chunk(msg.content),
                 OutboundMessageKind::Full => PromptFragment::Full {
                     content: msg.content,
                     cancelled,
@@ -1519,7 +1657,10 @@ mod tests {
         assert!(ch.send(msg).await.is_ok());
         match rx.recv().await.expect("must receive fragment") {
             PromptFragment::Full { cancelled, .. } => {
-                assert!(cancelled, "cancelled flag must be forwarded to HTTP handler");
+                assert!(
+                    cancelled,
+                    "cancelled flag must be forwarded to HTTP handler"
+                );
             }
             other => panic!("expected Full, got {other:?}"),
         }
@@ -1582,10 +1723,8 @@ mod tests {
                 .insert(session_id.clone(), PendingPrompt { cancelled: false });
             ch.pending_http.lock().await.insert(session_id.clone(), tx);
         }
-        let msg =
-            OutboundMessage::new(ACP_HTTP_CHANNEL_NAME, &session_id, "tok ").with_kind(
-                OutboundMessageKind::Chunk,
-            );
+        let msg = OutboundMessage::new(ACP_HTTP_CHANNEL_NAME, &session_id, "tok ")
+            .with_kind(OutboundMessageKind::Chunk);
         assert!(ch.send(msg).await.is_ok());
         match rx.recv().await.expect("must receive fragment") {
             PromptFragment::Chunk(content) => assert_eq!(content, "tok "),
@@ -1625,6 +1764,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_custom_emits_custom_fragment() {
+        let ch = make_channel();
+        let session_id = "acph_custom".to_string();
+        let (tx, mut rx) = mpsc::channel::<PromptFragment>(PROMPT_FRAGMENT_BUFFER);
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            st.pending
+                .insert(session_id.clone(), PendingPrompt { cancelled: false });
+            ch.pending_http.lock().await.insert(session_id.clone(), tx);
+        }
+        let msg = OutboundMessage::new(ACP_HTTP_CHANNEL_NAME, &session_id, "")
+            .with_kind(OutboundMessageKind::Custom)
+            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+            .with_metadata(
+                OUTBOUND_CUSTOM_PAYLOAD_KEY,
+                r#"{"requestId":"01JTEST","toolName":"write_file"}"#,
+            );
+        assert!(ch.send(msg).await.is_ok());
+        match rx.recv().await.expect("must receive fragment") {
+            PromptFragment::Custom { name, payload } => {
+                assert_eq!(name, "ui:approval_request");
+                assert_eq!(payload["toolName"], "write_file");
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_deny_by_default_blocks_session_new() {
         let bus = Arc::new(MessageBus::new());
         let base = BaseChannelConfig {
@@ -1654,6 +1828,103 @@ mod tests {
             "deny_by_default must block session/new"
         );
         assert!(ch.state.lock().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_inject_inbound_unknown_session_returns_server_error() {
+        let ch = make_channel();
+        let body = AcpHttpChannel::do_inject_inbound(
+            &ch.state,
+            &ch.base_config,
+            &ch.bus,
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!({
+                "sessionId": "acph_missing",
+                "content": "yes",
+                "kind": "approval_response",
+                "requestId": "req_1"
+            })),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_inject_inbound_reports_delivered_true_when_intercepted() {
+        let ch = make_channel();
+        let session_id = "acph_inject_true".to_string();
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+        }
+        ch.bus
+            .set_inbound_interceptor(Arc::new(|msg: &InboundMessage| {
+                msg.metadata.get("inject_kind").map(String::as_str) == Some("approval_response")
+                    && msg.metadata.get("request_id").map(String::as_str) == Some("req_1")
+            }));
+        let body = AcpHttpChannel::do_inject_inbound(
+            &ch.state,
+            &ch.base_config,
+            &ch.bus,
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!({
+                "sessionId": session_id,
+                "content": "yes",
+                "kind": "approval_response",
+                "requestId": "req_1"
+            })),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["delivered"], true);
+    }
+
+    #[tokio::test]
+    async fn test_inject_inbound_reports_delivered_false_when_queued() {
+        let ch = make_channel();
+        let session_id = "acph_inject_false".to_string();
+        {
+            let mut st = ch.state.lock().await;
+            st.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+        }
+        let body = AcpHttpChannel::do_inject_inbound(
+            &ch.state,
+            &ch.base_config,
+            &ch.bus,
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!({
+                "sessionId": session_id,
+                "content": "yes",
+                "kind": "approval_response",
+                "requestId": "req_1"
+            })),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["delivered"], false);
+        let inbound = ch
+            .bus
+            .consume_inbound()
+            .await
+            .expect("inbound must be queued");
+        assert_eq!(inbound.chat_id, "acph_inject_false");
+        assert_eq!(
+            inbound.metadata.get("request_id").map(String::as_str),
+            Some("req_1")
+        );
     }
 
     #[test]
@@ -2054,7 +2325,10 @@ mod tests {
             .await
             .expect("inbound must be published");
         assert_eq!(
-            inbound.metadata.get("streaming_capable").map(String::as_str),
+            inbound
+                .metadata
+                .get("streaming_capable")
+                .map(String::as_str),
             Some("true"),
             "inbound must carry streaming_capable=true",
         );

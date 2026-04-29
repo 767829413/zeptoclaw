@@ -90,14 +90,7 @@ struct CompiledRule {
 /// - `InputOnly` — only tool input (e.g. shell injection patterns that
 ///   legitimately appear in tool output such as web page markdown).
 /// - `Both` — input and output.
-const RULE_DEFS: &[(
-    &str,
-    PolicySeverity,
-    PolicyAction,
-    &str,
-    &str,
-    PolicyScope,
-)] = &[
+const RULE_DEFS: &[(&str, PolicySeverity, PolicyAction, &str, &str, PolicyScope)] = &[
     // 1. System file access
     (
         "system_file_access",

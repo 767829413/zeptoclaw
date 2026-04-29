@@ -13,6 +13,15 @@ use std::collections::HashMap;
 /// content as a protocol-level error; channels that don't simply render the
 /// text, which is a sane fallback.
 pub const OUTBOUND_ERROR_KEY: &str = "error";
+/// Metadata key carrying the logical name of a structured custom outbound
+/// payload (e.g. `ui:approval_request`).
+pub const OUTBOUND_CUSTOM_NAME_KEY: &str = "custom.name";
+/// Metadata key carrying serialized JSON (`serde_json::to_string`) for custom
+/// outbound payloads.
+pub const OUTBOUND_CUSTOM_PAYLOAD_KEY: &str = "custom.payload";
+/// Optional metadata key carrying plain-text fallback text for channels that
+/// cannot render structured custom payloads.
+pub const OUTBOUND_CUSTOM_SUMMARY_KEY: &str = "custom.summary";
 
 /// Represents an incoming message from a channel (e.g., Telegram, Discord, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +69,12 @@ pub enum OutboundMessageKind {
     /// empty (the full reply has already been transmitted via `Chunk`s).
     /// Signals the ACP transport to write its `session/prompt` response.
     ChunkEnd,
+    /// Structured custom payload encoded via reserved metadata keys
+    /// (`custom.name`, `custom.payload`, optional `custom.summary`).
+    ///
+    /// ACP channels map this into `session/update` extension frames. Other
+    /// channels may ignore it or choose to render `custom.summary`.
+    Custom,
 }
 
 impl OutboundMessageKind {
@@ -536,16 +551,14 @@ mod tests {
     #[test]
     fn outbound_missing_kind_deserializes_as_full() {
         // JSON from an older producer — no `kind` field.
-        let legacy =
-            r#"{"channel":"discord","chat_id":"c1","content":"hi","reply_to":null}"#;
+        let legacy = r#"{"channel":"discord","chat_id":"c1","content":"hi","reply_to":null}"#;
         let msg: OutboundMessage = serde_json::from_str(legacy).expect("deserialize");
         assert_eq!(msg.kind, OutboundMessageKind::Full);
     }
 
     #[test]
     fn outbound_chunk_kind_roundtrips() {
-        let msg = OutboundMessage::new("acp", "sess1", "tok")
-            .with_kind(OutboundMessageKind::Chunk);
+        let msg = OutboundMessage::new("acp", "sess1", "tok").with_kind(OutboundMessageKind::Chunk);
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains("\"kind\":\"chunk\""), "json: {json}");
         let back: OutboundMessage = serde_json::from_str(&json).expect("deserialize");
@@ -555,11 +568,32 @@ mod tests {
 
     #[test]
     fn outbound_chunk_end_kind_roundtrips() {
-        let msg = OutboundMessage::new("acp", "sess1", "")
-            .with_kind(OutboundMessageKind::ChunkEnd);
+        let msg = OutboundMessage::new("acp", "sess1", "").with_kind(OutboundMessageKind::ChunkEnd);
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains("\"kind\":\"chunk_end\""), "json: {json}");
         let back: OutboundMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.kind, OutboundMessageKind::ChunkEnd);
+    }
+
+    #[test]
+    fn outbound_custom_kind_roundtrips() {
+        let msg = OutboundMessage::new("acp_http", "sess1", "")
+            .with_kind(OutboundMessageKind::Custom)
+            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+            .with_metadata(
+                OUTBOUND_CUSTOM_PAYLOAD_KEY,
+                r#"{"requestId":"01JTEST","toolName":"write_file"}"#,
+            )
+            .with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, "approval needed");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"kind\":\"custom\""), "json: {json}");
+        let back: OutboundMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.kind, OutboundMessageKind::Custom);
+        assert_eq!(
+            back.metadata
+                .get(OUTBOUND_CUSTOM_NAME_KEY)
+                .map(String::as_str),
+            Some("ui:approval_request")
+        );
     }
 }

@@ -5,16 +5,22 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::FutureExt;
+use serde::Serialize;
 use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::agent::context_monitor::{CompactionUrgency, ContextMonitor, PreflightAction};
 use crate::agent::loop_guard::{truncate_utf8, LoopGuard, LoopGuardAction, ToolCallSig};
+use crate::bus::message::{
+    OutboundMessageKind, OUTBOUND_CUSTOM_NAME_KEY, OUTBOUND_CUSTOM_PAYLOAD_KEY,
+    OUTBOUND_CUSTOM_SUMMARY_KEY,
+};
 use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
 use crate::cache::ResponseCache;
 use crate::config::Config;
@@ -54,11 +60,152 @@ const TRUSTED_LOCAL_SESSION_METADATA_KEY: &str = "trusted_local_session";
 /// `Chunk`/`ChunkEnd` fragments. Channels that do not set this flag receive
 /// the legacy single `Full` reply.
 const STREAMING_CAPABLE_METADATA_KEY: &str = "streaming_capable";
+const FILE_ARTIFACT_EVENT_NAME: &str = "ui:file_artifact";
+const ACP_HTTP_CHANNEL: &str = "acp_http";
 
 fn is_streaming_capable(msg: &InboundMessage) -> bool {
     msg.metadata
         .get(STREAMING_CAPABLE_METADATA_KEY)
         .is_some_and(|v| v == "true")
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileArtifactOperation {
+    Write,
+    Edit,
+}
+
+#[derive(Debug, Clone)]
+struct FileArtifactCandidate {
+    raw_path: String,
+    existed_before: bool,
+    operation: FileArtifactOperation,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileArtifactPayload {
+    path: String,
+    name: String,
+    size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
+    operation: &'static str,
+}
+
+fn resolve_workspace_path(workspace: &Path, raw_path: &str) -> PathBuf {
+    let path = Path::new(raw_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    }
+}
+
+fn prepare_file_artifact_candidate(
+    tool_name: &str,
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> Option<FileArtifactCandidate> {
+    if ctx.channel.as_deref() != Some(ACP_HTTP_CHANNEL) {
+        return None;
+    }
+    let workspace = Path::new(ctx.workspace.as_deref()?);
+    let raw_path = args.get("path")?.as_str()?.to_string();
+    let operation = match tool_name {
+        "write_file" => FileArtifactOperation::Write,
+        "edit_file" => FileArtifactOperation::Edit,
+        _ => return None,
+    };
+    let full_path = resolve_workspace_path(workspace, &raw_path);
+    let existed_before = full_path.exists();
+    Some(FileArtifactCandidate {
+        raw_path,
+        existed_before,
+        operation,
+    })
+}
+
+fn infer_file_mime(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "md" => "text/markdown",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "py" => "text/x-python",
+        "rs" => "text/plain",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "html" | "htm" => "text/html",
+        "js" => "text/javascript",
+        "ts" | "tsx" => "text/plain",
+        "css" => "text/css",
+        "csv" => "text/csv",
+        _ => return None,
+    })
+}
+
+fn build_file_artifact_payload(
+    candidate: &FileArtifactCandidate,
+    ctx: &ToolContext,
+) -> Option<FileArtifactPayload> {
+    let workspace = Path::new(ctx.workspace.as_deref()?);
+    let workspace_canon = workspace.canonicalize().ok()?;
+    let full_path = resolve_workspace_path(workspace, &candidate.raw_path);
+    let full_path_canon = full_path.canonicalize().ok()?;
+    if !full_path_canon.starts_with(&workspace_canon) {
+        return None;
+    }
+    let metadata = std::fs::metadata(&full_path_canon).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let relative = full_path_canon
+        .strip_prefix(&workspace_canon)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let name = full_path_canon.file_name()?.to_string_lossy().to_string();
+    let operation = match candidate.operation {
+        FileArtifactOperation::Edit => "modified",
+        FileArtifactOperation::Write => {
+            if candidate.existed_before {
+                "modified"
+            } else {
+                "created"
+            }
+        }
+    };
+    Some(FileArtifactPayload {
+        path: relative,
+        name,
+        size_bytes: metadata.len(),
+        mime: infer_file_mime(&full_path_canon).map(str::to_string),
+        operation,
+    })
+}
+
+async fn publish_file_artifact_event(
+    bus: &Arc<MessageBus>,
+    ctx: &ToolContext,
+    payload: &FileArtifactPayload,
+) {
+    let (Some(channel), Some(chat_id)) = (ctx.channel.as_deref(), ctx.chat_id.as_deref()) else {
+        return;
+    };
+    if channel != ACP_HTTP_CHANNEL {
+        return;
+    }
+    let Ok(payload_json) = serde_json::to_string(payload) else {
+        return;
+    };
+    let summary = format!("[file] {} {}", payload.operation, payload.path);
+    let msg = OutboundMessage::new(channel, chat_id, "")
+        .with_kind(OutboundMessageKind::Custom)
+        .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, FILE_ARTIFACT_EVENT_NAME)
+        .with_metadata(OUTBOUND_CUSTOM_PAYLOAD_KEY, &payload_json)
+        .with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, &summary);
+    let _ = bus.publish_outbound(msg).await;
 }
 
 type ApprovalFuture = Pin<Box<dyn Future<Output = ApprovalResponse> + Send>>;
@@ -1512,6 +1659,8 @@ impl AgentLoop {
                         if dry_run {
                             return (id, Self::dry_run_result(&name, &args, &raw_args, budget), false);
                         }
+                        let file_artifact_candidate =
+                            prepare_file_artifact_candidate(&name, &args, &ctx);
 
                         // Send tool starting feedback
                         if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
@@ -1591,6 +1740,11 @@ impl AgentLoop {
                             }
                         }
                         if success {
+                            if let Some(candidate) = file_artifact_candidate.as_ref() {
+                                if let Some(payload) = build_file_artifact_payload(candidate, &ctx) {
+                                    publish_file_artifact_event(&bus_for_tools, &ctx, &payload).await;
+                                }
+                            }
                             debug!(tool = %name, latency_ms = latency_ms, "Tool executed successfully");
                             hooks.after_tool(&name, &result, elapsed, channel_name, chat_id);
                             if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
@@ -2437,6 +2591,8 @@ impl AgentLoop {
                         if dry_run {
                             return (id, Self::dry_run_result(&name, &args, &raw_args, budget), false);
                         }
+                        let file_artifact_candidate =
+                            prepare_file_artifact_candidate(&name, &args, &ctx);
 
                         // Send tool starting feedback
                         if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
@@ -2513,6 +2669,11 @@ impl AgentLoop {
                             }
                         }
                         if success {
+                            if let Some(candidate) = file_artifact_candidate.as_ref() {
+                                if let Some(payload) = build_file_artifact_payload(candidate, &ctx) {
+                                    publish_file_artifact_event(&bus_for_tools, &ctx, &payload).await;
+                                }
+                            }
                             debug!(tool = %name, latency_ms = latency_ms, "Tool executed successfully");
                             hooks.after_tool(&name, &result, elapsed, channel_name, chat_id);
                             if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
@@ -3662,6 +3823,7 @@ mod tests {
     use crate::hooks::{HookAction, HookRule};
     use crate::providers::{LLMResponse, StreamEvent, ToolDefinition, Usage};
     use async_trait::async_trait;
+    use tempfile::tempdir;
 
     #[derive(Debug)]
     struct TestProvider {
@@ -3742,6 +3904,72 @@ mod tests {
             }
         }
         panic!("stream ended without a Done event");
+    }
+
+    #[test]
+    fn test_build_file_artifact_payload_created_for_new_write() {
+        let workspace = tempdir().expect("create workspace tempdir");
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let file_path = workspace.path().join("note.md");
+        std::fs::write(&file_path, "hello").expect("write file");
+
+        let ctx = ToolContext::new()
+            .with_channel("acp_http", "chat_1")
+            .with_workspace(&workspace_path);
+        let candidate = FileArtifactCandidate {
+            raw_path: "note.md".to_string(),
+            existed_before: false,
+            operation: FileArtifactOperation::Write,
+        };
+
+        let payload = build_file_artifact_payload(&candidate, &ctx).expect("payload");
+        assert_eq!(payload.path, "note.md");
+        assert_eq!(payload.name, "note.md");
+        assert_eq!(payload.operation, "created");
+        assert_eq!(payload.size_bytes, 5);
+        assert_eq!(payload.mime.as_deref(), Some("text/markdown"));
+    }
+
+    #[test]
+    fn test_build_file_artifact_payload_modified_for_edit() {
+        let workspace = tempdir().expect("create workspace tempdir");
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let file_path = workspace.path().join("app.py");
+        std::fs::write(&file_path, "print(1)\n").expect("write file");
+
+        let ctx = ToolContext::new()
+            .with_channel("acp_http", "chat_1")
+            .with_workspace(&workspace_path);
+        let candidate = FileArtifactCandidate {
+            raw_path: "app.py".to_string(),
+            existed_before: true,
+            operation: FileArtifactOperation::Edit,
+        };
+
+        let payload = build_file_artifact_payload(&candidate, &ctx).expect("payload");
+        assert_eq!(payload.path, "app.py");
+        assert_eq!(payload.operation, "modified");
+        assert_eq!(payload.mime.as_deref(), Some("text/x-python"));
+    }
+
+    #[test]
+    fn test_build_file_artifact_payload_rejects_outside_workspace() {
+        let workspace = tempdir().expect("create workspace tempdir");
+        let outside = tempdir().expect("create outside tempdir");
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").expect("write outside file");
+
+        let ctx = ToolContext::new()
+            .with_channel("acp_http", "chat_1")
+            .with_workspace(workspace.path().to_string_lossy().as_ref());
+        let candidate = FileArtifactCandidate {
+            raw_path: outside_file.to_string_lossy().to_string(),
+            existed_before: false,
+            operation: FileArtifactOperation::Write,
+        };
+
+        let payload = build_file_artifact_payload(&candidate, &ctx);
+        assert!(payload.is_none(), "outside workspace path must be rejected");
     }
 
     #[tokio::test]

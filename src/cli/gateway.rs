@@ -8,6 +8,10 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+use zeptoclaw::bus::message::{
+    OutboundMessageKind, OUTBOUND_CUSTOM_NAME_KEY, OUTBOUND_CUSTOM_PAYLOAD_KEY,
+    OUTBOUND_CUSTOM_SUMMARY_KEY,
+};
 use zeptoclaw::bus::{InboundInterceptor, MessageBus, OutboundMessage};
 use zeptoclaw::channels::{register_configured_channels, ChannelManager};
 use zeptoclaw::config::watcher::ConfigWatcher;
@@ -310,22 +314,27 @@ pub(crate) async fn cmd_gateway(
     bus.set_inbound_interceptor({
         let broker = Arc::clone(&broker);
         Arc::new(move |msg: &zeptoclaw::bus::InboundMessage| {
-            let text = msg.content.trim().to_lowercase();
-            // "yes all" / "no all" / "approve all" / "deny all" — resolve every pending
-            let all = text.ends_with(" all") || text == "all" || text == "全部";
-            let approved = match text
-                .trim_end_matches(" all")
-                .trim_end_matches("全部")
-                .trim()
-            {
-                "yes" | "y" | "approve" | "是" => Some(true),
-                "no" | "n" | "deny" | "否" => Some(false),
-                _ => None,
+            let Some((approved, all)) = parse_approval_reply(&msg.content) else {
+                return false;
             };
-            match (approved, all) {
-                (Some(value), true) => broker.resolve_all(&msg.chat_id, value) > 0,
-                (Some(value), false) => broker.resolve(&msg.chat_id, value),
-                _ => false,
+            match msg.metadata.get("inject_kind").map(String::as_str) {
+                Some("approval_response") => {
+                    let Some(request_id) = msg.metadata.get("request_id").map(String::as_str)
+                    else {
+                        return false;
+                    };
+                    if all {
+                        if !broker.has_pending_request(&msg.chat_id, request_id) {
+                            return false;
+                        }
+                        broker.resolve_all(&msg.chat_id, approved) > 0
+                    } else {
+                        broker.resolve(&msg.chat_id, request_id, approved)
+                    }
+                }
+                Some(_) => false,
+                None if all => broker.resolve_all(&msg.chat_id, approved) > 0,
+                None => broker.resolve_oldest(&msg.chat_id, approved),
             }
         }) as InboundInterceptor
     });
@@ -688,6 +697,33 @@ fn resolve_approval_timeout(config: &Config) -> u64 {
     }
 }
 
+fn parse_approval_reply(content: &str) -> Option<(bool, bool)> {
+    let text = content.trim().to_lowercase();
+    let all = text.ends_with(" all") || text == "all" || text == "全部";
+    let normalized = text
+        .trim_end_matches(" all")
+        .trim_end_matches("全部")
+        .trim();
+    let approved = match normalized {
+        "yes" | "y" | "approve" | "是" => true,
+        "no" | "n" | "deny" | "否" => false,
+        _ => return None,
+    };
+    Some((approved, all))
+}
+
+fn is_acp_channel(channel: &str) -> bool {
+    channel == "acp" || channel == "acp_http"
+}
+
+fn approval_decision_label(outcome: &ApprovalResponse) -> Option<&'static str> {
+    match outcome {
+        ApprovalResponse::Approved => Some("approve"),
+        ApprovalResponse::Denied(_) => Some("deny"),
+        ApprovalResponse::TimedOut => None,
+    }
+}
+
 async fn register_approval_handler(
     agent: &zeptoclaw::agent::AgentLoop,
     broker: &Arc<ApprovalBroker>,
@@ -710,23 +746,31 @@ async fn register_approval_handler(
                     _ => return ApprovalResponse::Denied("No channel routing context for approval".into()),
                 };
 
-                let rx = broker.register(&chat_id);
+                let request_id = ulid::Ulid::new().to_string();
+                let rx = broker.register(&chat_id, &request_id);
 
                 // Format the approval prompt. Shell commands get a clean code-block
                 // display; other tools show pretty-printed JSON arguments.
+                let shell_command = request
+                    .arguments
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let shell_timeout_secs = request.arguments.get("timeout").and_then(|v| v.as_u64());
                 let args_display = if request.tool_name == "shell" {
-                    let cmd = request
-                        .arguments
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("<no command>");
-                    let timeout = request
-                        .arguments
-                        .get("timeout")
-                        .and_then(|v| v.as_u64())
+                    let cmd = shell_command.as_deref().unwrap_or("<no command>");
+                    let timeout = shell_timeout_secs
                         .map(|t| format!("  timeout: {}s", t))
                         .unwrap_or_default();
-                    format!("```sh\n{}\n```{}", cmd, if timeout.is_empty() { String::new() } else { format!("\n{}", timeout) })
+                    format!(
+                        "```sh\n{}\n```{}",
+                        cmd,
+                        if timeout.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n{}", timeout)
+                        }
+                    )
                 } else {
                     let pretty = serde_json::to_string_pretty(&request.arguments)
                         .unwrap_or_else(|_| request.arguments.to_string());
@@ -746,15 +790,54 @@ async fn register_approval_handler(
                     args_display,
                     batch_hint,
                 );
-                let _ = bus
-                    .publish_outbound(OutboundMessage::new(&channel, &chat_id, &prompt))
-                    .await;
+                if is_acp_channel(&channel) {
+                    let mut payload = serde_json::json!({
+                        "requestId": request_id.clone(),
+                        "toolName": request.tool_name,
+                        "arguments": request.arguments,
+                        "pendingTotal": pending,
+                    });
+                    if let Some(cmd) = shell_command.as_deref() {
+                        payload["shellCommand"] = serde_json::Value::String(cmd.to_string());
+                    }
+                    if let Some(timeout) = shell_timeout_secs {
+                        payload["timeoutSecs"] = serde_json::Value::Number(timeout.into());
+                    }
+                    let payload_text = payload.to_string();
+                    let msg = OutboundMessage::new(&channel, &chat_id, "")
+                        .with_kind(OutboundMessageKind::Custom)
+                        .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+                        .with_metadata(OUTBOUND_CUSTOM_PAYLOAD_KEY, &payload_text)
+                        .with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, &prompt);
+                    let _ = bus.publish_outbound(msg).await;
+                } else {
+                    let _ = bus
+                        .publish_outbound(OutboundMessage::new(&channel, &chat_id, &prompt))
+                        .await;
+                }
 
-                match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+                let outcome =
+                    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
                     Ok(Ok(true)) => ApprovalResponse::Approved,
                     Ok(Ok(false)) => ApprovalResponse::Denied("User denied".into()),
                     _ => ApprovalResponse::TimedOut,
+                };
+
+                if is_acp_channel(&channel) {
+                    if let Some(decision) = approval_decision_label(&outcome) {
+                        let payload = serde_json::json!({
+                            "requestId": request_id,
+                            "decision": decision,
+                        });
+                        let payload_text = payload.to_string();
+                        let msg = OutboundMessage::new(&channel, &chat_id, "")
+                            .with_kind(OutboundMessageKind::Custom)
+                            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_resolved")
+                            .with_metadata(OUTBOUND_CUSTOM_PAYLOAD_KEY, &payload_text);
+                        let _ = bus.publish_outbound(msg).await;
+                    }
                 }
+                outcome
             }
             .boxed()
         })
@@ -803,5 +886,16 @@ mod tests {
         let changed = diff_hot_reload_sections(&old, &new);
         assert!(changed.contains(&"safety"));
         assert!(!changed.contains(&"gateway"));
+    }
+
+    #[test]
+    fn test_parse_approval_reply_variants() {
+        assert_eq!(parse_approval_reply("yes"), Some((true, false)));
+        assert_eq!(parse_approval_reply("no"), Some((false, false)));
+        assert_eq!(parse_approval_reply("approve all"), Some((true, true)));
+        assert_eq!(parse_approval_reply("deny all"), Some((false, true)));
+        assert_eq!(parse_approval_reply("是"), Some((true, false)));
+        assert_eq!(parse_approval_reply("否"), Some((false, false)));
+        assert_eq!(parse_approval_reply("maybe"), None);
     }
 }

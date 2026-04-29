@@ -267,6 +267,14 @@ pub struct SessionUpdatePayload {
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Extension: logical name for app-defined custom updates when
+    /// `session_update == "agent_custom"`.
+    #[serde(rename = "customName", skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<String>,
+    /// Extension: JSON payload for app-defined custom updates when
+    /// `session_update == "agent_custom"`.
+    #[serde(rename = "customPayload", skip_serializing_if = "Option::is_none")]
+    pub custom_payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +305,7 @@ pub fn strip_agent_error_prefix(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn strip_agent_error_prefix_removes_prefix_once() {
@@ -313,5 +322,50 @@ mod tests {
         // are passed through unchanged.
         assert_eq!(strip_agent_error_prefix("error: lower"), "error: lower");
         assert_eq!(strip_agent_error_prefix("Error:no-space"), "Error:no-space");
+    }
+
+    #[test]
+    fn session_update_payload_agent_custom_roundtrip() {
+        let payload = SessionUpdatePayload {
+            session_update: "agent_custom".to_string(),
+            content: None,
+            tool_call_id: None,
+            title: None,
+            kind: None,
+            status: None,
+            custom_name: Some("ui:approval_request".to_string()),
+            custom_payload: Some(json!({"requestId":"01JTEST","decision":"approve"})),
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v["sessionUpdate"], "agent_custom");
+        assert_eq!(v["customName"], "ui:approval_request");
+        assert!(v.get("content").is_none());
+        let back: SessionUpdatePayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back.custom_name.as_deref(), Some("ui:approval_request"));
+        assert_eq!(
+            back.custom_payload.as_ref().and_then(|p| p.get("decision")),
+            Some(&json!("approve"))
+        );
+    }
+
+    #[test]
+    fn session_update_payload_agent_message_omits_custom_fields() {
+        let payload = SessionUpdatePayload {
+            session_update: "agent_message_chunk".to_string(),
+            content: Some(ContentBlock::text("hi")),
+            tool_call_id: None,
+            title: None,
+            kind: None,
+            status: None,
+            custom_name: None,
+            custom_payload: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert!(v.get("customName").is_none());
+        assert!(v.get("customPayload").is_none());
+        let back: SessionUpdatePayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back.session_update, "agent_message_chunk");
+        assert!(back.custom_name.is_none());
+        assert!(back.custom_payload.is_none());
     }
 }

@@ -141,17 +141,28 @@ impl MessageBus {
     /// }
     /// ```
     pub async fn publish_inbound(&self, msg: InboundMessage) -> Result<()> {
+        self.publish_inbound_with_status(msg).await.map(|_| ())
+    }
+
+    /// Publishes an inbound message and reports whether the interceptor
+    /// consumed it.
+    ///
+    /// Returns `Ok(true)` when an installed interceptor handled the message
+    /// (so it was **not** queued for the agent loop), `Ok(false)` when the
+    /// message was enqueued normally, and an error when queueing failed.
+    pub async fn publish_inbound_with_status(&self, msg: InboundMessage) -> Result<bool> {
         if let Ok(guard) = self.inbound_interceptor.read() {
             if let Some(interceptor) = guard.as_ref() {
                 if interceptor(&msg) {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
         self.inbound_tx
             .send(msg)
             .await
-            .map_err(|_| ZeptoError::BusClosed)
+            .map_err(|_| ZeptoError::BusClosed)?;
+        Ok(false)
     }
 
     /// Consumes the next inbound message from the bus.
@@ -269,10 +280,15 @@ impl MessageBus {
     /// - `Err(ZeptoError::BusClosed)` if the channel is closed
     /// - `Err(ZeptoError::Channel)` if the buffer is full
     pub fn try_publish_inbound(&self, msg: InboundMessage) -> Result<()> {
+        self.try_publish_inbound_with_status(msg).map(|_| ())
+    }
+
+    /// Non-blocking variant of [`publish_inbound_with_status`].
+    pub fn try_publish_inbound_with_status(&self, msg: InboundMessage) -> Result<bool> {
         if let Ok(guard) = self.inbound_interceptor.read() {
             if let Some(interceptor) = guard.as_ref() {
                 if interceptor(&msg) {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -281,7 +297,8 @@ impl MessageBus {
                 ZeptoError::Channel("inbound buffer full".to_string())
             }
             mpsc::error::TrySendError::Closed(_) => ZeptoError::BusClosed,
-        })
+        })?;
+        Ok(false)
     }
 
     /// Tries to publish an outbound message without blocking.
@@ -478,6 +495,30 @@ mod tests {
         let msg3 = InboundMessage::new("test", "user", "chat", "Msg 3");
         let result = bus.try_publish_inbound(msg3);
         assert!(matches!(result, Err(ZeptoError::Channel(_))));
+    }
+
+    #[tokio::test]
+    async fn test_publish_inbound_with_status_reports_intercepted() {
+        let bus = MessageBus::new();
+        bus.set_inbound_interceptor(Arc::new(|_msg: &InboundMessage| true));
+        let msg = InboundMessage::new("test", "u1", "c1", "hello");
+        let intercepted = bus.publish_inbound_with_status(msg).await.unwrap();
+        assert!(intercepted);
+        let recv =
+            tokio::time::timeout(std::time::Duration::from_millis(20), bus.consume_inbound()).await;
+        assert!(
+            recv.is_err(),
+            "intercepted inbound should not be queued for consume_inbound"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_inbound_with_status_reports_queued() {
+        let bus = MessageBus::new();
+        let msg = InboundMessage::new("test", "u1", "c1", "hello");
+        let intercepted = bus.publish_inbound_with_status(msg).await.unwrap();
+        assert!(!intercepted);
+        assert!(bus.consume_inbound().await.is_some());
     }
 
     #[tokio::test]
