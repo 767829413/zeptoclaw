@@ -3973,6 +3973,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_publish_file_artifact_event_emits_custom_outbound() {
+        let workspace = tempdir().expect("create workspace tempdir");
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let file_path = workspace.path().join("note.md");
+        std::fs::write(&file_path, "hello").expect("write file");
+        let ctx = ToolContext::new()
+            .with_channel("acp_http", "chat_1")
+            .with_workspace(&workspace_path);
+        let candidate = FileArtifactCandidate {
+            raw_path: "note.md".to_string(),
+            existed_before: false,
+            operation: FileArtifactOperation::Write,
+        };
+        let payload = build_file_artifact_payload(&candidate, &ctx).expect("payload");
+        let bus = Arc::new(MessageBus::new());
+
+        publish_file_artifact_event(&bus, &ctx, &payload).await;
+
+        let outbound = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            bus.consume_outbound(),
+        )
+        .await
+        .expect("timeout waiting for outbound message")
+        .expect("missing outbound message");
+        assert_eq!(outbound.kind, OutboundMessageKind::Custom);
+        assert_eq!(
+            outbound.metadata.get(OUTBOUND_CUSTOM_NAME_KEY).map(String::as_str),
+            Some(FILE_ARTIFACT_EVENT_NAME)
+        );
+        assert_eq!(
+            outbound
+                .metadata
+                .get(OUTBOUND_CUSTOM_SUMMARY_KEY)
+                .map(String::as_str),
+            Some("[file] created note.md")
+        );
+        let payload_raw = outbound
+            .metadata
+            .get(OUTBOUND_CUSTOM_PAYLOAD_KEY)
+            .expect("missing custom payload");
+        let payload_json: serde_json::Value =
+            serde_json::from_str(payload_raw).expect("custom payload must be json");
+        assert_eq!(payload_json["path"], "note.md");
+        assert_eq!(payload_json["name"], "note.md");
+        assert_eq!(payload_json["operation"], "created");
+        assert_eq!(payload_json["sizeBytes"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_publish_file_artifact_event_skips_non_acp_http_channel() {
+        let workspace = tempdir().expect("create workspace tempdir");
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let file_path = workspace.path().join("note.md");
+        std::fs::write(&file_path, "hello").expect("write file");
+        let ctx = ToolContext::new()
+            .with_channel("telegram", "chat_1")
+            .with_workspace(&workspace_path);
+        let candidate = FileArtifactCandidate {
+            raw_path: "note.md".to_string(),
+            existed_before: false,
+            operation: FileArtifactOperation::Write,
+        };
+        let payload = build_file_artifact_payload(&candidate, &ctx).expect("payload");
+        let bus = Arc::new(MessageBus::new());
+
+        publish_file_artifact_event(&bus, &ctx, &payload).await;
+
+        let outbound = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            bus.consume_outbound(),
+        )
+        .await;
+        assert!(
+            outbound.is_err(),
+            "non-acp_http channel should not receive file artifact outbound"
+        );
+    }
+
+    #[tokio::test]
     async fn test_agent_loop_creation() {
         let config = Config::default();
         let session_manager = SessionManager::new_memory();
