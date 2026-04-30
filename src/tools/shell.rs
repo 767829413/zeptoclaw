@@ -173,7 +173,16 @@ impl Tool for ShellTool {
 
         let formatted =
             truncate_tool_output(&output.format(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-        Ok(ToolOutput::user_visible(formatted))
+
+        // ACP transports already render approval cards/file artifacts and expect
+        // the assistant's final synthesis. Emitting raw shell output as an
+        // intermediate user-visible chunk causes awkward duplicated text in chat.
+        let hide_user_echo = matches!(ctx.channel.as_deref(), Some("acp" | "acp_http"));
+        if hide_user_echo {
+            Ok(ToolOutput::llm_only(formatted))
+        } else {
+            Ok(ToolOutput::user_visible(formatted))
+        }
     }
 }
 
@@ -190,6 +199,33 @@ mod tests {
         let result = tool.execute(json!({"command": "echo hello"}), &ctx).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().for_llm.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_shell_hides_user_echo_on_acp_channels() {
+        let tool = ShellTool::new();
+        let ctx = ToolContext::new().with_channel("acp_http", "chat_1");
+
+        let result = tool.execute(json!({"command": "echo hello"}), &ctx).await;
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.for_llm.trim(), "hello");
+        assert!(output.for_user.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_shell_keeps_user_echo_on_non_acp_channels() {
+        let tool = ShellTool::new();
+        let ctx = ToolContext::new().with_channel("discord", "chat_1");
+
+        let result = tool.execute(json!({"command": "echo hello"}), &ctx).await;
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.for_llm.trim(), "hello");
+        assert!(output
+            .for_user
+            .as_deref()
+            .is_some_and(|msg| msg.contains("hello")));
     }
 
     #[tokio::test]
