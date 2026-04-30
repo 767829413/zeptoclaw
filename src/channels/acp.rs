@@ -13,7 +13,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
-use crate::bus::message::{OutboundMessageKind, OUTBOUND_CUSTOM_SUMMARY_KEY};
+use crate::bus::message::{
+    OutboundMessageKind, OUTBOUND_CUSTOM_NAME_KEY, OUTBOUND_CUSTOM_PAYLOAD_KEY,
+    OUTBOUND_CUSTOM_SUMMARY_KEY,
+};
 use crate::bus::{InboundMessage, MessageBus, OutboundMessage};
 use crate::config::AcpChannelConfig;
 use crate::error::{Result, ZeptoError};
@@ -49,6 +52,8 @@ struct SessionEntry {
 struct AcpState {
     /// Whether the client has called initialize.
     initialized: bool,
+    /// Whether this ACP client supports structured custom session updates.
+    custom_updates_supported: bool,
     /// Session IDs → session entry (cwd + last-active timestamp).
     sessions: HashMap<String, SessionEntry>,
     /// Per-session pending prompt: we respond when we get the matching outbound message.
@@ -59,6 +64,7 @@ impl AcpState {
     fn new() -> Self {
         Self {
             initialized: false,
+            custom_updates_supported: false,
             sessions: HashMap::new(),
             pending: HashMap::new(),
         }
@@ -757,10 +763,15 @@ impl AcpChannel {
         params: Option<serde_json::Value>,
     ) -> Result<()> {
         // Parse client info for diagnostics; missing or malformed params are fine.
+        let mut supports_custom_updates = false;
         if let Some(init_params) = params
             .and_then(|p| serde_json::from_value::<super::acp_protocol::InitializeParams>(p).ok())
         {
             if let Some(ref client_info) = init_params.client_info {
+                supports_custom_updates = client_info
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name == "openshell-scheduler");
                 info!(
                     client_name = ?client_info.name,
                     client_version = ?client_info.version,
@@ -777,6 +788,7 @@ impl AcpChannel {
         {
             let mut state = self.state.lock().await;
             state.initialized = true;
+            state.custom_updates_supported = supports_custom_updates;
         }
         let result = InitializeResult {
             protocol_version: serde_json::json!("1"),
@@ -945,6 +957,55 @@ impl AcpChannel {
         };
         self.write_response(&response).await
     }
+
+    async fn send_custom(&self, msg: &OutboundMessage) -> Result<bool> {
+        let Some(name) = msg.metadata.get(OUTBOUND_CUSTOM_NAME_KEY).cloned() else {
+            return Ok(false);
+        };
+        let Some(payload_text) = msg.metadata.get(OUTBOUND_CUSTOM_PAYLOAD_KEY) else {
+            return Ok(false);
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_text) else {
+            return Ok(false);
+        };
+
+        let session_id = &msg.chat_id;
+        let known = {
+            let mut state = self.state.lock().await;
+            if !state.custom_updates_supported {
+                return Ok(false);
+            }
+            match state.sessions.get_mut(session_id) {
+                Some(entry) => {
+                    entry.last_active = std::time::Instant::now();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !known {
+            debug!(session_id = %session_id, "ACP: custom update for unknown session, skipping");
+            return Ok(true);
+        }
+
+        let update = SessionUpdateParams {
+            session_id: session_id.clone(),
+            update: SessionUpdatePayload {
+                session_update: "agent_custom".to_string(),
+                content: None,
+                tool_call_id: None,
+                title: None,
+                kind: None,
+                status: None,
+                custom_name: Some(name),
+                custom_payload: Some(payload),
+            },
+        };
+        let params = serde_json::to_value(&update)
+            .map_err(|e| ZeptoError::Channel(format!("ACP: serialize custom update: {}", e)))?;
+        self.write_notification("session/update", &params).await?;
+        Ok(true)
+    }
 }
 
 #[async_trait]
@@ -1016,8 +1077,11 @@ impl Channel for AcpChannel {
                 return self.send_chunk_end(&msg.chat_id).await;
             }
             OutboundMessageKind::Custom => {
-                // stdio ACP clients that don't understand custom structured
-                // updates still get a textual fallback summary as a chunk.
+                if self.send_custom(&msg).await? {
+                    return Ok(());
+                }
+                // Backward-compat fallback for clients that only provide
+                // summary text and no structured custom payload.
                 let Some(summary) = msg.metadata.get(OUTBOUND_CUSTOM_SUMMARY_KEY).cloned() else {
                     return Ok(());
                 };
@@ -1794,6 +1858,47 @@ mod tests {
         assert!(
             state.pending.contains_key(&session_id),
             "custom summary fallback must not close pending prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_custom_payload_keeps_pending_open() {
+        let config = AcpChannelConfig::default();
+        let base = BaseChannelConfig::new("acp");
+        let bus = Arc::new(MessageBus::new());
+        let channel = AcpChannel::new(config, base, bus);
+        let session_id = "acp_custom_payload".to_string();
+        {
+            let mut state = channel.state.lock().await;
+            state.custom_updates_supported = true;
+            state.sessions.insert(
+                session_id.clone(),
+                SessionEntry {
+                    cwd: "/test".to_string(),
+                    last_active: std::time::Instant::now(),
+                },
+            );
+            state.pending.insert(
+                session_id.clone(),
+                PendingPrompt {
+                    request_id: serde_json::json!(12),
+                    cancelled: false,
+                },
+            );
+        }
+        let msg = OutboundMessage::new(ACP_CHANNEL_NAME, &session_id, "")
+            .with_kind(OutboundMessageKind::Custom)
+            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+            .with_metadata(
+                OUTBOUND_CUSTOM_PAYLOAD_KEY,
+                r#"{"requestId":"req-1","toolName":"shell","arguments":{}}"#,
+            )
+            .with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, "approval required");
+        assert!(channel.send(msg).await.is_ok());
+        let state = channel.state.lock().await;
+        assert!(
+            state.pending.contains_key(&session_id),
+            "custom payload updates must not close pending prompt"
         );
     }
 

@@ -62,6 +62,11 @@ const TRUSTED_LOCAL_SESSION_METADATA_KEY: &str = "trusted_local_session";
 const STREAMING_CAPABLE_METADATA_KEY: &str = "streaming_capable";
 const FILE_ARTIFACT_EVENT_NAME: &str = "ui:file_artifact";
 const ACP_HTTP_CHANNEL: &str = "acp_http";
+const ACP_STDIO_CHANNEL: &str = "acp";
+
+fn supports_custom_ui_channel(channel: &str) -> bool {
+    channel == ACP_HTTP_CHANNEL || channel == ACP_STDIO_CHANNEL
+}
 
 fn is_streaming_capable(msg: &InboundMessage) -> bool {
     msg.metadata
@@ -107,7 +112,11 @@ fn prepare_file_artifact_candidate(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> Option<FileArtifactCandidate> {
-    if ctx.channel.as_deref() != Some(ACP_HTTP_CHANNEL) {
+    if !ctx
+        .channel
+        .as_deref()
+        .is_some_and(supports_custom_ui_channel)
+    {
         return None;
     }
     let workspace = Path::new(ctx.workspace.as_deref()?);
@@ -193,7 +202,7 @@ async fn publish_file_artifact_event(
     let (Some(channel), Some(chat_id)) = (ctx.channel.as_deref(), ctx.chat_id.as_deref()) else {
         return;
     };
-    if channel != ACP_HTTP_CHANNEL {
+    if !supports_custom_ui_channel(channel) {
         return;
     }
     let Ok(payload_json) = serde_json::to_string(payload) else {
@@ -3427,9 +3436,8 @@ impl AgentLoop {
                 match event {
                     StreamEvent::Delta(text) => {
                         had_delta = true;
-                        let mut chunk =
-                            OutboundMessage::new(&msg.channel, &msg.chat_id, &text)
-                                .with_kind(OutboundMessageKind::Chunk);
+                        let mut chunk = OutboundMessage::new(&msg.channel, &msg.chat_id, &text)
+                            .with_kind(OutboundMessageKind::Chunk);
                         propagate_routing_metadata(&mut chunk, msg);
                         if let Err(e) = self.bus.publish_outbound(chunk).await {
                             error!("Failed to publish chunk: {}", e);
@@ -3482,8 +3490,7 @@ impl AgentLoop {
                         error!("Failed to publish chunk-end: {}", e);
                     }
                 } else {
-                    let mut full =
-                        OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
+                    let mut full = OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
                     propagate_routing_metadata(&mut full, msg);
                     if let Err(e) = self.bus.publish_outbound(full).await {
                         error!("Failed to publish full reply: {}", e);
@@ -3498,11 +3505,8 @@ impl AgentLoop {
                     metrics.record_error();
                 }
 
-                let mut err_msg = OutboundMessage::new(
-                    &msg.channel,
-                    &msg.chat_id,
-                    &format!("Error: {}", e),
-                );
+                let mut err_msg =
+                    OutboundMessage::new(&msg.channel, &msg.chat_id, &format!("Error: {}", e));
                 err_msg.mark_error();
                 propagate_routing_metadata(&mut err_msg, msg);
                 self.bus.publish_outbound(err_msg).await.ok();
@@ -3535,8 +3539,7 @@ impl AgentLoop {
             }
         };
 
-        let slo =
-            crate::utils::slo::SessionSLO::evaluate(&self.metrics_collector, agent_completed);
+        let slo = crate::utils::slo::SessionSLO::evaluate(&self.metrics_collector, agent_completed);
         slo.emit();
         debug!(slo_summary = %slo.summary(), "Session SLO summary (streaming)");
 
@@ -4000,7 +4003,10 @@ mod tests {
         .expect("missing outbound message");
         assert_eq!(outbound.kind, OutboundMessageKind::Custom);
         assert_eq!(
-            outbound.metadata.get(OUTBOUND_CUSTOM_NAME_KEY).map(String::as_str),
+            outbound
+                .metadata
+                .get(OUTBOUND_CUSTOM_NAME_KEY)
+                .map(String::as_str),
             Some(FILE_ARTIFACT_EVENT_NAME)
         );
         assert_eq!(
@@ -4023,6 +4029,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_publish_file_artifact_event_emits_custom_outbound_for_acp_stdio() {
+        let workspace = tempdir().expect("create workspace tempdir");
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let file_path = workspace.path().join("note.md");
+        std::fs::write(&file_path, "hello").expect("write file");
+        let ctx = ToolContext::new()
+            .with_channel("acp", "chat_1")
+            .with_workspace(&workspace_path);
+        let candidate = FileArtifactCandidate {
+            raw_path: "note.md".to_string(),
+            existed_before: false,
+            operation: FileArtifactOperation::Write,
+        };
+        let payload = build_file_artifact_payload(&candidate, &ctx).expect("payload");
+        let bus = Arc::new(MessageBus::new());
+
+        publish_file_artifact_event(&bus, &ctx, &payload).await;
+
+        let outbound = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            bus.consume_outbound(),
+        )
+        .await
+        .expect("timeout waiting for outbound message")
+        .expect("missing outbound message");
+        assert_eq!(outbound.kind, OutboundMessageKind::Custom);
+        assert_eq!(outbound.channel, "acp");
+        assert_eq!(
+            outbound
+                .metadata
+                .get(OUTBOUND_CUSTOM_NAME_KEY)
+                .map(String::as_str),
+            Some(FILE_ARTIFACT_EVENT_NAME)
+        );
+    }
+
+    #[tokio::test]
     async fn test_publish_file_artifact_event_skips_non_acp_http_channel() {
         let workspace = tempdir().expect("create workspace tempdir");
         let workspace_path = workspace.path().to_string_lossy().to_string();
@@ -4041,14 +4084,12 @@ mod tests {
 
         publish_file_artifact_event(&bus, &ctx, &payload).await;
 
-        let outbound = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            bus.consume_outbound(),
-        )
-        .await;
+        let outbound =
+            tokio::time::timeout(std::time::Duration::from_millis(50), bus.consume_outbound())
+                .await;
         assert!(
             outbound.is_err(),
-            "non-acp_http channel should not receive file artifact outbound"
+            "non-acp channel should not receive file artifact outbound"
         );
     }
 
