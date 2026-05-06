@@ -33,8 +33,10 @@ pub(crate) fn read_line() -> Result<String> {
 
 /// Read a password/API key from stdin (hidden input).
 pub(crate) fn read_secret() -> Result<String> {
-    rpassword::read_password_from_bufread(&mut std::io::stdin().lock())
-        .with_context(|| "Failed to read secret input")
+    let config = rpassword::ConfigBuilder::new()
+        .input_reader(std::io::stdin())
+        .build();
+    rpassword::read_password_with_config(config).with_context(|| "Failed to read secret input")
 }
 
 /// Expand `~/` prefix to the user's home directory.
