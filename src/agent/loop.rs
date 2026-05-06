@@ -61,6 +61,8 @@ const TRUSTED_LOCAL_SESSION_METADATA_KEY: &str = "trusted_local_session";
 /// the legacy single `Full` reply.
 const STREAMING_CAPABLE_METADATA_KEY: &str = "streaming_capable";
 const FILE_ARTIFACT_EVENT_NAME: &str = "ui:file_artifact";
+const THINKING_STATUS_EVENT_NAME: &str = "ui:thinking_status";
+const TOOL_CALL_EVENT_NAME: &str = "ui:tool_call";
 const ACP_HTTP_CHANNEL: &str = "acp_http";
 const ACP_STDIO_CHANNEL: &str = "acp";
 
@@ -96,6 +98,24 @@ struct FileArtifactPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     mime: Option<String>,
     operation: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThinkingStatusPayload {
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallStatusPayload {
+    tool_call_id: String,
+    tool_name: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 fn resolve_workspace_path(workspace: &Path, raw_path: &str) -> PathBuf {
@@ -199,7 +219,26 @@ async fn publish_file_artifact_event(
     ctx: &ToolContext,
     payload: &FileArtifactPayload,
 ) {
-    let (Some(channel), Some(chat_id)) = (ctx.channel.as_deref(), ctx.chat_id.as_deref()) else {
+    publish_custom_ui_event(
+        bus,
+        ctx.channel.as_deref(),
+        ctx.chat_id.as_deref(),
+        FILE_ARTIFACT_EVENT_NAME,
+        payload,
+        Some(&format!("[file] {} {}", payload.operation, payload.path)),
+    )
+    .await;
+}
+
+async fn publish_custom_ui_event<T: Serialize>(
+    bus: &Arc<MessageBus>,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    event_name: &str,
+    payload: &T,
+    summary: Option<&str>,
+) {
+    let (Some(channel), Some(chat_id)) = (channel, chat_id) else {
         return;
     };
     if !supports_custom_ui_channel(channel) {
@@ -208,13 +247,76 @@ async fn publish_file_artifact_event(
     let Ok(payload_json) = serde_json::to_string(payload) else {
         return;
     };
-    let summary = format!("[file] {} {}", payload.operation, payload.path);
-    let msg = OutboundMessage::new(channel, chat_id, "")
+    let mut msg = OutboundMessage::new(channel, chat_id, "")
         .with_kind(OutboundMessageKind::Custom)
-        .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, FILE_ARTIFACT_EVENT_NAME)
-        .with_metadata(OUTBOUND_CUSTOM_PAYLOAD_KEY, &payload_json)
-        .with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, &summary);
+        .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, event_name)
+        .with_metadata(OUTBOUND_CUSTOM_PAYLOAD_KEY, &payload_json);
+    if let Some(summary) = summary.filter(|v| !v.is_empty()) {
+        msg = msg.with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, summary);
+    }
     let _ = bus.publish_outbound(msg).await;
+}
+
+async fn publish_thinking_status_event(
+    bus: &Arc<MessageBus>,
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    status: &'static str,
+) {
+    let payload = ThinkingStatusPayload { status };
+    let summary = match status {
+        "thinking" => Some("[thinking] started"),
+        "done" => Some("[thinking] done"),
+        _ => None,
+    };
+    publish_custom_ui_event(
+        bus,
+        channel,
+        chat_id,
+        THINKING_STATUS_EVENT_NAME,
+        &payload,
+        summary,
+    )
+    .await;
+}
+
+async fn publish_tool_call_status_event(
+    bus: &Arc<MessageBus>,
+    ctx: &ToolContext,
+    tool_call_id: &str,
+    tool_name: &str,
+    status: &'static str,
+    elapsed_ms: Option<u64>,
+    error: Option<&str>,
+) {
+    let payload = ToolCallStatusPayload {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        status,
+        elapsed_ms,
+        error: error.map(ToString::to_string),
+    };
+    let summary = match status {
+        "started" => Some(format!("[tool] {} started", tool_name)),
+        "done" => Some(format!(
+            "[tool] {} done{}",
+            tool_name,
+            elapsed_ms
+                .map(|ms| format!(" ({}ms)", ms))
+                .unwrap_or_default()
+        )),
+        "failed" => Some(format!("[tool] {} failed", tool_name)),
+        _ => None,
+    };
+    publish_custom_ui_event(
+        bus,
+        ctx.channel.as_deref(),
+        ctx.chat_id.as_deref(),
+        TOOL_CALL_EVENT_NAME,
+        &payload,
+        summary.as_deref(),
+    )
+    .await;
 }
 
 type ApprovalFuture = Pin<Box<dyn Future<Output = ApprovalResponse> + Send>>;
@@ -1354,6 +1456,13 @@ impl AgentLoop {
                 args_json: None,
             });
         }
+        publish_thinking_status_event(
+            &self.bus,
+            Some(&msg.channel),
+            Some(&msg.chat_id),
+            "thinking",
+        )
+        .await;
 
         // Call LLM with overflow retry -- provider lock is NOT held during this await
         let mut response = {
@@ -1422,6 +1531,8 @@ impl AgentLoop {
                 args_json: None,
             });
         }
+        publish_thinking_status_event(&self.bus, Some(&msg.channel), Some(&msg.chat_id), "done")
+            .await;
 
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
             metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
@@ -1679,6 +1790,16 @@ impl AgentLoop {
                                 args_json: Some(raw_args.clone()),
                             });
                         }
+                        publish_tool_call_status_event(
+                            &bus_for_tools,
+                            &ctx,
+                            &id,
+                            &name,
+                            "started",
+                            None,
+                            None,
+                        )
+                        .await;
                         #[cfg(feature = "panel")]
                         if let Some(bus) = &event_bus {
                             bus.send(crate::api::events::PanelEvent::ToolStarted {
@@ -1763,6 +1884,16 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            publish_tool_call_status_event(
+                                &bus_for_tools,
+                                &ctx,
+                                &id,
+                                &name,
+                                "done",
+                                Some(latency_ms),
+                                None,
+                            )
+                            .await;
                             #[cfg(feature = "panel")]
                             if let Some(bus) = &event_bus {
                                 bus.send(crate::api::events::PanelEvent::ToolDone {
@@ -1786,6 +1917,16 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            publish_tool_call_status_event(
+                                &bus_for_tools,
+                                &ctx,
+                                &id,
+                                &name,
+                                "failed",
+                                Some(latency_ms),
+                                Some(&result),
+                            )
+                            .await;
                             #[cfg(feature = "panel")]
                             if let Some(bus) = &event_bus {
                                 bus.send(crate::api::events::PanelEvent::ToolFailed {
@@ -2035,6 +2176,13 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
+            publish_thinking_status_event(
+                &self.bus,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+                "thinking",
+            )
+            .await;
 
             response = {
                 let max_retries = self.config.compaction.overflow_retries;
@@ -2101,6 +2249,13 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
+            publish_thinking_status_event(
+                &self.bus,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+                "done",
+            )
+            .await;
 
             if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
             {
@@ -2314,6 +2469,13 @@ impl AgentLoop {
                 args_json: None,
             });
         }
+        publish_thinking_status_event(
+            &self.bus,
+            Some(&msg.channel),
+            Some(&msg.chat_id),
+            "thinking",
+        )
+        .await;
 
         // First call: non-streaming to see if there are tool calls, with overflow retry
         let mut response = {
@@ -2380,6 +2542,8 @@ impl AgentLoop {
                 args_json: None,
             });
         }
+        publish_thinking_status_event(&self.bus, Some(&msg.channel), Some(&msg.chat_id), "done")
+            .await;
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
             metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
@@ -2611,6 +2775,16 @@ impl AgentLoop {
                                 args_json: Some(raw_args.clone()),
                             });
                         }
+                        publish_tool_call_status_event(
+                            &bus_for_tools,
+                            &ctx,
+                            &id,
+                            &name,
+                            "started",
+                            None,
+                            None,
+                        )
+                        .await;
                         #[cfg(feature = "panel")]
                         if let Some(bus) = &event_bus {
                             bus.send(crate::api::events::PanelEvent::ToolStarted {
@@ -2694,6 +2868,16 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            publish_tool_call_status_event(
+                                &bus_for_tools,
+                                &ctx,
+                                &id,
+                                &name,
+                                "done",
+                                Some(latency_ms),
+                                None,
+                            )
+                            .await;
                             #[cfg(feature = "panel")]
                             if let Some(bus) = &event_bus {
                                 bus.send(crate::api::events::PanelEvent::ToolDone {
@@ -2717,6 +2901,16 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            publish_tool_call_status_event(
+                                &bus_for_tools,
+                                &ctx,
+                                &id,
+                                &name,
+                                "failed",
+                                Some(latency_ms),
+                                Some(&result),
+                            )
+                            .await;
                             #[cfg(feature = "panel")]
                             if let Some(bus) = &event_bus {
                                 bus.send(crate::api::events::PanelEvent::ToolFailed {
@@ -2878,6 +3072,13 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
+            publish_thinking_status_event(
+                &self.bus,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+                "thinking",
+            )
+            .await;
 
             response = {
                 let max_retries = self.config.compaction.overflow_retries;
@@ -2942,6 +3143,13 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
+            publish_thinking_status_event(
+                &self.bus,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+                "done",
+            )
+            .await;
             if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
             {
                 metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
