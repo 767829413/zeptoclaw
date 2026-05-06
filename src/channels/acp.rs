@@ -1192,6 +1192,7 @@ impl Channel for AcpChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::agui_events;
     use crate::config::AcpChannelConfig;
 
     #[tokio::test]
@@ -1888,7 +1889,7 @@ mod tests {
         }
         let msg = OutboundMessage::new(ACP_CHANNEL_NAME, &session_id, "")
             .with_kind(OutboundMessageKind::Custom)
-            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, agui_events::APPROVAL_REQUEST)
             .with_metadata(
                 OUTBOUND_CUSTOM_PAYLOAD_KEY,
                 r#"{"requestId":"req-1","toolName":"shell","arguments":{}}"#,

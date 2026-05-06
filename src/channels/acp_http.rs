@@ -1485,6 +1485,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::agui_events;
     use crate::bus::MessageBus;
     use crate::config::{AcpChannelConfig, AcpHttpConfig};
 
@@ -1783,7 +1784,7 @@ mod tests {
         }
         let msg = OutboundMessage::new(ACP_HTTP_CHANNEL_NAME, &session_id, "")
             .with_kind(OutboundMessageKind::Custom)
-            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, agui_events::APPROVAL_REQUEST)
             .with_metadata(
                 OUTBOUND_CUSTOM_PAYLOAD_KEY,
                 r#"{"requestId":"01JTEST","toolName":"write_file"}"#,
@@ -1791,7 +1792,7 @@ mod tests {
         assert!(ch.send(msg).await.is_ok());
         match rx.recv().await.expect("must receive fragment") {
             PromptFragment::Custom { name, payload } => {
-                assert_eq!(name, "ui:approval_request");
+                assert_eq!(name, agui_events::APPROVAL_REQUEST);
                 assert_eq!(payload["toolName"], "write_file");
             }
             other => panic!("expected Custom, got {other:?}"),

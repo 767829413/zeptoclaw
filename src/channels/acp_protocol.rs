@@ -305,6 +305,7 @@ pub fn strip_agent_error_prefix(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::agui_events;
     use serde_json::json;
 
     #[test]
@@ -333,15 +334,18 @@ mod tests {
             title: None,
             kind: None,
             status: None,
-            custom_name: Some("ui:approval_request".to_string()),
+            custom_name: Some(agui_events::APPROVAL_REQUEST.to_string()),
             custom_payload: Some(json!({"requestId":"01JTEST","decision":"approve"})),
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert_eq!(v["sessionUpdate"], "agent_custom");
-        assert_eq!(v["customName"], "ui:approval_request");
+        assert_eq!(v["customName"], agui_events::APPROVAL_REQUEST);
         assert!(v.get("content").is_none());
         let back: SessionUpdatePayload = serde_json::from_value(v).unwrap();
-        assert_eq!(back.custom_name.as_deref(), Some("ui:approval_request"));
+        assert_eq!(
+            back.custom_name.as_deref(),
+            Some(agui_events::APPROVAL_REQUEST)
+        );
         assert_eq!(
             back.custom_payload.as_ref().and_then(|p| p.get("decision")),
             Some(&json!("approve"))

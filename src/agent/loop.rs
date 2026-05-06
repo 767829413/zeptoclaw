@@ -15,6 +15,7 @@ use serde::Serialize;
 use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
+use crate::agent::agui_events;
 use crate::agent::context_monitor::{CompactionUrgency, ContextMonitor, PreflightAction};
 use crate::agent::loop_guard::{truncate_utf8, LoopGuard, LoopGuardAction, ToolCallSig};
 use crate::bus::message::{
@@ -26,7 +27,7 @@ use crate::cache::ResponseCache;
 use crate::config::Config;
 use crate::error::{ProviderError, Result, ZeptoError};
 use crate::health::UsageMetrics;
-use crate::providers::{ChatOptions, LLMProvider, LLMToolCall};
+use crate::providers::{ChatOptions, LLMProvider, LLMResponse, LLMToolCall};
 use crate::safety::SafetyLayer;
 use crate::session::{Message, Role, SessionManager, ToolCall};
 use crate::tools::approval::{ApprovalGate, ApprovalRequest, ApprovalResponse};
@@ -60,9 +61,6 @@ const TRUSTED_LOCAL_SESSION_METADATA_KEY: &str = "trusted_local_session";
 /// `Chunk`/`ChunkEnd` fragments. Channels that do not set this flag receive
 /// the legacy single `Full` reply.
 const STREAMING_CAPABLE_METADATA_KEY: &str = "streaming_capable";
-const FILE_ARTIFACT_EVENT_NAME: &str = "ui:file_artifact";
-const THINKING_STATUS_EVENT_NAME: &str = "ui:thinking_status";
-const TOOL_CALL_EVENT_NAME: &str = "ui:tool_call";
 const ACP_HTTP_CHANNEL: &str = "acp_http";
 const ACP_STDIO_CHANNEL: &str = "acp";
 static THINKING_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -110,6 +108,8 @@ struct ThinkingStatusPayload {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +120,10 @@ struct ToolCallStatusPayload {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,11 +136,53 @@ struct ThinkingEventToken {
     started_at: std::time::Instant,
 }
 
+struct ThinkingScope {
+    bus: Arc<MessageBus>,
+    channel: String,
+    chat_id: String,
+    token: ThinkingEventToken,
+}
+
 fn start_thinking_event_token() -> ThinkingEventToken {
     let id = THINKING_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
     ThinkingEventToken {
         thought_id: format!("thought_{}", id),
         started_at: std::time::Instant::now(),
+    }
+}
+
+impl ThinkingScope {
+    async fn start(bus: Arc<MessageBus>, channel: &str, chat_id: &str) -> Self {
+        let token = start_thinking_event_token();
+        publish_thinking_status_event(
+            &bus,
+            Some(channel),
+            Some(chat_id),
+            &token.thought_id,
+            "thinking",
+            None,
+            None,
+        )
+        .await;
+        Self {
+            bus,
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            token,
+        }
+    }
+
+    async fn finish(self, detail: Option<&str>) {
+        publish_thinking_status_event(
+            &self.bus,
+            Some(self.channel.as_str()),
+            Some(self.chat_id.as_str()),
+            &self.token.thought_id,
+            "done",
+            Some(self.token.started_at.elapsed().as_millis() as u64),
+            detail,
+        )
+        .await;
     }
 }
 
@@ -249,7 +295,7 @@ async fn publish_file_artifact_event(
         bus,
         ctx.channel.as_deref(),
         ctx.chat_id.as_deref(),
-        FILE_ARTIFACT_EVENT_NAME,
+        agui_events::FILE_ARTIFACT,
         payload,
         Some(&format!("[file] {} {}", payload.operation, payload.path)),
     )
@@ -290,11 +336,13 @@ async fn publish_thinking_status_event(
     thought_id: &str,
     status: &'static str,
     elapsed_ms: Option<u64>,
+    detail: Option<&str>,
 ) {
     let payload = ThinkingStatusPayload {
         thought_id: thought_id.to_string(),
         status,
         elapsed_ms,
+        detail: detail.map(ToString::to_string),
     };
     let summary: Option<String> = match status {
         "thinking" => Some("[thinking] started".to_string()),
@@ -309,13 +357,14 @@ async fn publish_thinking_status_event(
         bus,
         channel,
         chat_id,
-        THINKING_STATUS_EVENT_NAME,
+        agui_events::THINKING_STATUS,
         &payload,
         summary.as_deref(),
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_tool_call_status_event(
     bus: &Arc<MessageBus>,
     ctx: &ToolContext,
@@ -323,6 +372,8 @@ async fn publish_tool_call_status_event(
     tool_name: &str,
     status: &'static str,
     elapsed_ms: Option<u64>,
+    arguments: Option<&str>,
+    result: Option<&str>,
     error: Option<&str>,
     result_preview: Option<&str>,
 ) {
@@ -331,6 +382,8 @@ async fn publish_tool_call_status_event(
         tool_name: tool_name.to_string(),
         status,
         elapsed_ms,
+        arguments: arguments.map(ToString::to_string),
+        result: result.map(ToString::to_string),
         error: error.map(ToString::to_string),
         result_preview: result_preview.map(ToString::to_string),
     };
@@ -350,7 +403,7 @@ async fn publish_tool_call_status_event(
         bus,
         ctx.channel.as_deref(),
         ctx.chat_id.as_deref(),
-        TOOL_CALL_EVENT_NAME,
+        agui_events::TOOL_CALL,
         &payload,
         summary.as_deref(),
     )
@@ -367,6 +420,90 @@ fn build_tool_result_preview(result: &str) -> Option<String> {
         preview.push_str("\n...");
     }
     Some(preview)
+}
+
+fn prettify_tool_arguments(raw_args: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw_args)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| raw_args.to_string())
+}
+
+fn build_thinking_detail(response: &LLMResponse) -> Option<String> {
+    let content = response.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let merged = format!("Model draft:\n{}", content);
+    let mut detail = truncate_utf8(&merged, 8000).to_string();
+    if detail.len() < merged.len() {
+        detail.push_str("\n...");
+    }
+    Some(detail)
+}
+
+enum ToolCallOutcome<'a> {
+    Done,
+    Failed { raw_error: &'a str },
+}
+
+fn build_tool_result_payload(result: &str, budget: usize) -> (String, Option<String>) {
+    let sanitized_result = crate::utils::sanitize::sanitize_tool_result(result, budget);
+    let result_preview = build_tool_result_preview(&sanitized_result);
+    (sanitized_result, result_preview)
+}
+
+async fn publish_tool_call_started_event(
+    bus: &Arc<MessageBus>,
+    ctx: &ToolContext,
+    tool_call_id: &str,
+    tool_name: &str,
+    pretty_args: &str,
+) {
+    publish_tool_call_status_event(
+        bus,
+        ctx,
+        tool_call_id,
+        tool_name,
+        "started",
+        None,
+        Some(pretty_args),
+        None,
+        None,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_tool_call_finished_event(
+    bus: &Arc<MessageBus>,
+    ctx: &ToolContext,
+    tool_call_id: &str,
+    tool_name: &str,
+    outcome: ToolCallOutcome<'_>,
+    elapsed_ms: u64,
+    pretty_args: &str,
+    sanitized_result: &str,
+    result_preview: Option<&str>,
+) {
+    let (status, error) = match outcome {
+        ToolCallOutcome::Done => ("done", None),
+        ToolCallOutcome::Failed { raw_error } => ("failed", Some(raw_error)),
+    };
+    publish_tool_call_status_event(
+        bus,
+        ctx,
+        tool_call_id,
+        tool_name,
+        status,
+        Some(elapsed_ms),
+        Some(pretty_args),
+        Some(sanitized_result),
+        error,
+        result_preview,
+    )
+    .await;
 }
 
 type ApprovalFuture = Pin<Box<dyn Future<Output = ApprovalResponse> + Send>>;
@@ -1506,16 +1643,8 @@ impl AgentLoop {
                 args_json: None,
             });
         }
-        let thinking_event = start_thinking_event_token();
-        publish_thinking_status_event(
-            &self.bus,
-            Some(&msg.channel),
-            Some(&msg.chat_id),
-            &thinking_event.thought_id,
-            "thinking",
-            None,
-        )
-        .await;
+        let thinking_scope =
+            ThinkingScope::start(Arc::clone(&self.bus), &msg.channel, &msg.chat_id).await;
 
         // Call LLM with overflow retry -- provider lock is NOT held during this await
         let mut response = {
@@ -1584,15 +1713,8 @@ impl AgentLoop {
                 args_json: None,
             });
         }
-        publish_thinking_status_event(
-            &self.bus,
-            Some(&msg.channel),
-            Some(&msg.chat_id),
-            &thinking_event.thought_id,
-            "done",
-            Some(thinking_event.started_at.elapsed().as_millis() as u64),
-        )
-        .await;
+        let thinking_detail = build_thinking_detail(&response);
+        thinking_scope.finish(thinking_detail.as_deref()).await;
 
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
             metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
@@ -1841,6 +1963,7 @@ impl AgentLoop {
                         }
                         let file_artifact_candidate =
                             prepare_file_artifact_candidate(&name, &args, &ctx);
+                        let pretty_args = prettify_tool_arguments(&raw_args);
 
                         // Send tool starting feedback
                         if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
@@ -1850,15 +1973,12 @@ impl AgentLoop {
                                 args_json: Some(raw_args.clone()),
                             });
                         }
-                        publish_tool_call_status_event(
+                        publish_tool_call_started_event(
                             &bus_for_tools,
                             &ctx,
                             &id,
                             &name,
-                            "started",
-                            None,
-                            None,
-                            None,
+                            &pretty_args,
                         )
                         .await;
                         #[cfg(feature = "panel")]
@@ -1904,6 +2024,8 @@ impl AgentLoop {
                         let pause = tool_output.as_ref().is_some_and(|o| o.pause_for_input);
                         let elapsed = tool_start.elapsed();
                         let latency_ms = elapsed.as_millis() as u64;
+                        let (sanitized_result, result_preview) =
+                            build_tool_result_payload(&result, budget);
                         // Send to user if tool opted in
                         if let Some(ref output) = tool_output {
                             if let Some(ref user_msg) = output.for_user {
@@ -1945,17 +2067,15 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
-                            let result_preview = build_tool_result_preview(
-                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
-                            );
-                            publish_tool_call_status_event(
+                            publish_tool_call_finished_event(
                                 &bus_for_tools,
                                 &ctx,
                                 &id,
                                 &name,
-                                "done",
-                                Some(latency_ms),
-                                None,
+                                ToolCallOutcome::Done,
+                                latency_ms,
+                                &pretty_args,
+                                &sanitized_result,
                                 result_preview.as_deref(),
                             )
                             .await;
@@ -1982,17 +2102,15 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
-                            let result_preview = build_tool_result_preview(
-                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
-                            );
-                            publish_tool_call_status_event(
+                            publish_tool_call_finished_event(
                                 &bus_for_tools,
                                 &ctx,
                                 &id,
                                 &name,
-                                "failed",
-                                Some(latency_ms),
-                                Some(&result),
+                                ToolCallOutcome::Failed { raw_error: &result },
+                                latency_ms,
+                                &pretty_args,
+                                &sanitized_result,
                                 result_preview.as_deref(),
                             )
                             .await;
@@ -2005,13 +2123,7 @@ impl AgentLoop {
                             }
                         }
 
-                        // Sanitize the result with dynamic budget
-                        let sanitized = crate::utils::sanitize::sanitize_tool_result(
-                            &result,
-                            budget,
-                        );
-
-                        (id, sanitized, pause)
+                        (id, sanitized_result, pause)
                     }
                 })
                 .collect();
@@ -2245,16 +2357,8 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
-            let thinking_event = start_thinking_event_token();
-            publish_thinking_status_event(
-                &self.bus,
-                Some(&msg.channel),
-                Some(&msg.chat_id),
-                &thinking_event.thought_id,
-                "thinking",
-                None,
-            )
-            .await;
+            let thinking_scope =
+                ThinkingScope::start(Arc::clone(&self.bus), &msg.channel, &msg.chat_id).await;
 
             response = {
                 let max_retries = self.config.compaction.overflow_retries;
@@ -2321,15 +2425,8 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
-            publish_thinking_status_event(
-                &self.bus,
-                Some(&msg.channel),
-                Some(&msg.chat_id),
-                &thinking_event.thought_id,
-                "done",
-                Some(thinking_event.started_at.elapsed().as_millis() as u64),
-            )
-            .await;
+            let thinking_detail = build_thinking_detail(&response);
+            thinking_scope.finish(thinking_detail.as_deref()).await;
 
             if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
             {
@@ -2543,16 +2640,8 @@ impl AgentLoop {
                 args_json: None,
             });
         }
-        let thinking_event = start_thinking_event_token();
-        publish_thinking_status_event(
-            &self.bus,
-            Some(&msg.channel),
-            Some(&msg.chat_id),
-            &thinking_event.thought_id,
-            "thinking",
-            None,
-        )
-        .await;
+        let thinking_scope =
+            ThinkingScope::start(Arc::clone(&self.bus), &msg.channel, &msg.chat_id).await;
 
         // First call: non-streaming to see if there are tool calls, with overflow retry
         let mut response = {
@@ -2619,15 +2708,8 @@ impl AgentLoop {
                 args_json: None,
             });
         }
-        publish_thinking_status_event(
-            &self.bus,
-            Some(&msg.channel),
-            Some(&msg.chat_id),
-            &thinking_event.thought_id,
-            "done",
-            Some(thinking_event.started_at.elapsed().as_millis() as u64),
-        )
-        .await;
+        let thinking_detail = build_thinking_detail(&response);
+        thinking_scope.finish(thinking_detail.as_deref()).await;
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
             metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
@@ -2850,6 +2932,7 @@ impl AgentLoop {
                         }
                         let file_artifact_candidate =
                             prepare_file_artifact_candidate(&name, &args, &ctx);
+                        let pretty_args = prettify_tool_arguments(&raw_args);
 
                         // Send tool starting feedback
                         if let Some(tx) = tool_feedback_tx.read().await.as_ref() {
@@ -2859,15 +2942,12 @@ impl AgentLoop {
                                 args_json: Some(raw_args.clone()),
                             });
                         }
-                        publish_tool_call_status_event(
+                        publish_tool_call_started_event(
                             &bus_for_tools,
                             &ctx,
                             &id,
                             &name,
-                            "started",
-                            None,
-                            None,
-                            None,
+                            &pretty_args,
                         )
                         .await;
                         #[cfg(feature = "panel")]
@@ -2910,6 +2990,8 @@ impl AgentLoop {
                         let pause = tool_output.as_ref().is_some_and(|o| o.pause_for_input);
                         let elapsed = tool_start.elapsed();
                         let latency_ms = elapsed.as_millis() as u64;
+                        let (sanitized_result, result_preview) =
+                            build_tool_result_payload(&result, budget);
                         if let Some(output) = tool_output {
                             // Send to user if tool opted in
                             if let Some(ref user_msg) = output.for_user {
@@ -2953,17 +3035,15 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
-                            let result_preview = build_tool_result_preview(
-                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
-                            );
-                            publish_tool_call_status_event(
+                            publish_tool_call_finished_event(
                                 &bus_for_tools,
                                 &ctx,
                                 &id,
                                 &name,
-                                "done",
-                                Some(latency_ms),
-                                None,
+                                ToolCallOutcome::Done,
+                                latency_ms,
+                                &pretty_args,
+                                &sanitized_result,
                                 result_preview.as_deref(),
                             )
                             .await;
@@ -2990,17 +3070,15 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
-                            let result_preview = build_tool_result_preview(
-                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
-                            );
-                            publish_tool_call_status_event(
+                            publish_tool_call_finished_event(
                                 &bus_for_tools,
                                 &ctx,
                                 &id,
                                 &name,
-                                "failed",
-                                Some(latency_ms),
-                                Some(&result),
+                                ToolCallOutcome::Failed { raw_error: &result },
+                                latency_ms,
+                                &pretty_args,
+                                &sanitized_result,
                                 result_preview.as_deref(),
                             )
                             .await;
@@ -3012,10 +3090,7 @@ impl AgentLoop {
                                 });
                             }
                         }
-                        let sanitized =
-                            crate::utils::sanitize::sanitize_tool_result(&result, budget);
-
-                        (id, sanitized, pause)
+                        (id, sanitized_result, pause)
                     }
                 })
                 .collect();
@@ -3165,16 +3240,8 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
-            let thinking_event = start_thinking_event_token();
-            publish_thinking_status_event(
-                &self.bus,
-                Some(&msg.channel),
-                Some(&msg.chat_id),
-                &thinking_event.thought_id,
-                "thinking",
-                None,
-            )
-            .await;
+            let thinking_scope =
+                ThinkingScope::start(Arc::clone(&self.bus), &msg.channel, &msg.chat_id).await;
 
             response = {
                 let max_retries = self.config.compaction.overflow_retries;
@@ -3239,15 +3306,8 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
-            publish_thinking_status_event(
-                &self.bus,
-                Some(&msg.channel),
-                Some(&msg.chat_id),
-                &thinking_event.thought_id,
-                "done",
-                Some(thinking_event.started_at.elapsed().as_millis() as u64),
-            )
-            .await;
+            let thinking_detail = build_thinking_detail(&response);
+            thinking_scope.finish(thinking_detail.as_deref()).await;
             if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
             {
                 metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
@@ -4313,7 +4373,7 @@ mod tests {
                 .metadata
                 .get(OUTBOUND_CUSTOM_NAME_KEY)
                 .map(String::as_str),
-            Some(FILE_ARTIFACT_EVENT_NAME)
+            Some(agui_events::FILE_ARTIFACT)
         );
         assert_eq!(
             outbound
@@ -4367,7 +4427,7 @@ mod tests {
                 .metadata
                 .get(OUTBOUND_CUSTOM_NAME_KEY)
                 .map(String::as_str),
-            Some(FILE_ARTIFACT_EVENT_NAME)
+            Some(agui_events::FILE_ARTIFACT)
         );
     }
 

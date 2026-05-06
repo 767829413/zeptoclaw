@@ -54,6 +54,7 @@
 //! }
 //! ```
 
+pub mod agui_events;
 pub mod budget;
 pub mod compaction;
 mod context;

@@ -8,6 +8,7 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+use zeptoclaw::agent::agui_events;
 use zeptoclaw::bus::message::{
     OutboundMessageKind, OUTBOUND_CUSTOM_NAME_KEY, OUTBOUND_CUSTOM_PAYLOAD_KEY,
     OUTBOUND_CUSTOM_SUMMARY_KEY,
@@ -806,7 +807,7 @@ async fn register_approval_handler(
                     let payload_text = payload.to_string();
                     let msg = OutboundMessage::new(&channel, &chat_id, "")
                         .with_kind(OutboundMessageKind::Custom)
-                        .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+                        .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, agui_events::APPROVAL_REQUEST)
                         .with_metadata(OUTBOUND_CUSTOM_PAYLOAD_KEY, &payload_text)
                         .with_metadata(OUTBOUND_CUSTOM_SUMMARY_KEY, &prompt);
                     let _ = bus.publish_outbound(msg).await;
@@ -832,7 +833,7 @@ async fn register_approval_handler(
                         let payload_text = payload.to_string();
                         let msg = OutboundMessage::new(&channel, &chat_id, "")
                             .with_kind(OutboundMessageKind::Custom)
-                            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_resolved")
+                            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, agui_events::APPROVAL_RESOLVED)
                             .with_metadata(OUTBOUND_CUSTOM_PAYLOAD_KEY, &payload_text);
                         let _ = bus.publish_outbound(msg).await;
                     }

@@ -352,6 +352,8 @@ impl MediaAttachment {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::agui_events;
+
     use super::*;
 
     #[test]
@@ -579,7 +581,7 @@ mod tests {
     fn outbound_custom_kind_roundtrips() {
         let msg = OutboundMessage::new("acp_http", "sess1", "")
             .with_kind(OutboundMessageKind::Custom)
-            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, "ui:approval_request")
+            .with_metadata(OUTBOUND_CUSTOM_NAME_KEY, agui_events::APPROVAL_REQUEST)
             .with_metadata(
                 OUTBOUND_CUSTOM_PAYLOAD_KEY,
                 r#"{"requestId":"01JTEST","toolName":"write_file"}"#,
@@ -593,7 +595,7 @@ mod tests {
             back.metadata
                 .get(OUTBOUND_CUSTOM_NAME_KEY)
                 .map(String::as_str),
-            Some("ui:approval_request")
+            Some(agui_events::APPROVAL_REQUEST)
         );
     }
 }
