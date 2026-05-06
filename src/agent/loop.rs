@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -65,6 +65,7 @@ const THINKING_STATUS_EVENT_NAME: &str = "ui:thinking_status";
 const TOOL_CALL_EVENT_NAME: &str = "ui:tool_call";
 const ACP_HTTP_CHANNEL: &str = "acp_http";
 const ACP_STDIO_CHANNEL: &str = "acp";
+static THINKING_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn supports_custom_ui_channel(channel: &str) -> bool {
     channel == ACP_HTTP_CHANNEL || channel == ACP_STDIO_CHANNEL
@@ -103,7 +104,10 @@ struct FileArtifactPayload {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThinkingStatusPayload {
+    thought_id: String,
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +120,20 @@ struct ToolCallStatusPayload {
     elapsed_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ThinkingEventToken {
+    thought_id: String,
+    started_at: std::time::Instant,
+}
+
+fn start_thinking_event_token() -> ThinkingEventToken {
+    let id = THINKING_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
+    ThinkingEventToken {
+        thought_id: format!("thought_{}", id),
+        started_at: std::time::Instant::now(),
+    }
 }
 
 fn resolve_workspace_path(workspace: &Path, raw_path: &str) -> PathBuf {
@@ -261,12 +279,22 @@ async fn publish_thinking_status_event(
     bus: &Arc<MessageBus>,
     channel: Option<&str>,
     chat_id: Option<&str>,
+    thought_id: &str,
     status: &'static str,
+    elapsed_ms: Option<u64>,
 ) {
-    let payload = ThinkingStatusPayload { status };
-    let summary = match status {
-        "thinking" => Some("[thinking] started"),
-        "done" => Some("[thinking] done"),
+    let payload = ThinkingStatusPayload {
+        thought_id: thought_id.to_string(),
+        status,
+        elapsed_ms,
+    };
+    let summary: Option<String> = match status {
+        "thinking" => Some("[thinking] started".to_string()),
+        "done" => Some(
+            elapsed_ms
+                .map(|ms| format!("[thinking] done ({}ms)", ms))
+                .unwrap_or_else(|| "[thinking] done".to_string()),
+        ),
         _ => None,
     };
     publish_custom_ui_event(
@@ -275,7 +303,7 @@ async fn publish_thinking_status_event(
         chat_id,
         THINKING_STATUS_EVENT_NAME,
         &payload,
-        summary,
+        summary.as_deref(),
     )
     .await;
 }
@@ -1456,11 +1484,14 @@ impl AgentLoop {
                 args_json: None,
             });
         }
+        let thinking_event = start_thinking_event_token();
         publish_thinking_status_event(
             &self.bus,
             Some(&msg.channel),
             Some(&msg.chat_id),
+            &thinking_event.thought_id,
             "thinking",
+            None,
         )
         .await;
 
@@ -1531,8 +1562,15 @@ impl AgentLoop {
                 args_json: None,
             });
         }
-        publish_thinking_status_event(&self.bus, Some(&msg.channel), Some(&msg.chat_id), "done")
-            .await;
+        publish_thinking_status_event(
+            &self.bus,
+            Some(&msg.channel),
+            Some(&msg.chat_id),
+            &thinking_event.thought_id,
+            "done",
+            Some(thinking_event.started_at.elapsed().as_millis() as u64),
+        )
+        .await;
 
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
             metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
@@ -2176,11 +2214,14 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
+            let thinking_event = start_thinking_event_token();
             publish_thinking_status_event(
                 &self.bus,
                 Some(&msg.channel),
                 Some(&msg.chat_id),
+                &thinking_event.thought_id,
                 "thinking",
+                None,
             )
             .await;
 
@@ -2253,7 +2294,9 @@ impl AgentLoop {
                 &self.bus,
                 Some(&msg.channel),
                 Some(&msg.chat_id),
+                &thinking_event.thought_id,
                 "done",
+                Some(thinking_event.started_at.elapsed().as_millis() as u64),
             )
             .await;
 
@@ -2469,11 +2512,14 @@ impl AgentLoop {
                 args_json: None,
             });
         }
+        let thinking_event = start_thinking_event_token();
         publish_thinking_status_event(
             &self.bus,
             Some(&msg.channel),
             Some(&msg.chat_id),
+            &thinking_event.thought_id,
             "thinking",
+            None,
         )
         .await;
 
@@ -2542,8 +2588,15 @@ impl AgentLoop {
                 args_json: None,
             });
         }
-        publish_thinking_status_event(&self.bus, Some(&msg.channel), Some(&msg.chat_id), "done")
-            .await;
+        publish_thinking_status_event(
+            &self.bus,
+            Some(&msg.channel),
+            Some(&msg.chat_id),
+            &thinking_event.thought_id,
+            "done",
+            Some(thinking_event.started_at.elapsed().as_millis() as u64),
+        )
+        .await;
         if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref()) {
             metrics.record_tokens(usage.prompt_tokens as u64, usage.completion_tokens as u64);
         }
@@ -3072,11 +3125,14 @@ impl AgentLoop {
                     args_json: None,
                 });
             }
+            let thinking_event = start_thinking_event_token();
             publish_thinking_status_event(
                 &self.bus,
                 Some(&msg.channel),
                 Some(&msg.chat_id),
+                &thinking_event.thought_id,
                 "thinking",
+                None,
             )
             .await;
 
@@ -3147,7 +3203,9 @@ impl AgentLoop {
                 &self.bus,
                 Some(&msg.channel),
                 Some(&msg.chat_id),
+                &thinking_event.thought_id,
                 "done",
+                Some(thinking_event.started_at.elapsed().as_millis() as u64),
             )
             .await;
             if let (Some(metrics), Some(usage)) = (usage_metrics.as_ref(), response.usage.as_ref())
