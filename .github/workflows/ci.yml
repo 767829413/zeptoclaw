@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: taiki-e/install-action@85b24a67ef0c632dfefad70b9d5ce8fddb040754 # v2.75.10
+      - uses: taiki-e/install-action@58e862542551f667fa44c8a2a4a1d64ad477c96a # v2.75.17
         with:
           tool: nextest
       - run: cargo nextest run --lib
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: EmbarkStudios/cargo-deny-action@175dc7fd4fb85ec8f46948fb98f44db001149081 # v2.0.16
+      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2.0.17
 
   feature-matrix:
     name: Feature gates
@@ -81,9 +81,22 @@ jobs:
       matrix:
         features:
           - "--no-default-features"
+          - "--features memory-embedding"
+          - "--features screenshot"
           - "--features panel"
           - "--features tool-pdf"
           - "--features memory-hnsw"
+          - "--features channel-email"
+          - "--features google"
+          - "--features provider-vertex"
+          - "--features whatsapp-web"
+          - "--features hardware"
+          - "--features peripheral-rpi"
+          - "--features probe"
+          - "--features android"
+          - "--features sandbox-landlock"
+          - "--features sandbox-firejail"
+          - "--features sandbox-bubblewrap"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@stable
@@ -104,7 +117,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: coverage
-      - uses: taiki-e/install-action@85b24a67ef0c632dfefad70b9d5ce8fddb040754 # v2.75.10
+      - uses: taiki-e/install-action@58e862542551f667fa44c8a2a4a1d64ad477c96a # v2.75.17
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - name: Generate code coverage

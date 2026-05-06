@@ -3,7 +3,7 @@
 </p>
 <h1 align="center">ZeptoClaw</h1>
 <p align="center">
-  <strong>Ultra-lightweight personal AI assistant.</strong>
+  <strong>Fast, small, secure, and local-first personal AI assistant infrastructure.</strong>
 </p>
 <p align="center">
   <a href="https://zeptoclaw.com/docs/"><img src="https://img.shields.io/badge/docs-zeptoclaw.com-3b82f6?style=for-the-badge&logo=bookstack&logoColor=white" alt="Documentation"></a>
@@ -31,7 +31,7 @@ $ zeptoclaw agent --stream -m "Analyze our API for security issues"
 ✓ Analysis complete in 4.2s
 ```
 
-We studied the best AI assistants — and their tradeoffs. OpenClaw's integrations without the 100MB. NanoClaw's security without the TypeScript bundle. NemoClaw's governance without the 2GB Docker container. PicoClaw's size without the bare-bones feature set. One Rust binary with 33 tools, 11 channels, 16 providers, and 6 sandbox runtimes.
+ZeptoClaw is one Rust binary for running personal AI agents locally, at the edge, or on a VPS — with tools, memory, channels, providers, and sandboxed autonomy built in. We studied the best AI assistants — and their tradeoffs: OpenClaw's integrations without the 100MB, NanoClaw's security without the TypeScript bundle, NemoClaw's OpenShell guardrails without the Docker/k3s footprint, and PicoClaw's size without the bare-bones feature set.
 
 <p align="center">
   <img src="https://img.shields.io/badge/binary-~6MB-3b82f6" alt="~6MB binary">
@@ -45,18 +45,18 @@ We studied the best AI assistants — and their tradeoffs. OpenClaw's integratio
 
 We studied what works — and what doesn't.
 
-**OpenClaw** proved an AI assistant can handle 12 channels and 100+ skills. But it costs 100MB and 400K lines. **NanoClaw** proved security-first is possible. But it's still 50MB of TypeScript. **NemoClaw** proved enterprise governance matters — policy-locked sandboxes, federated inference routing. But it's a 2GB Docker container wrapping OpenClaw underneath, with zero built-in tools. **PicoClaw** proved AI assistants can run on $10 hardware. But it stripped out everything to get there.
+**OpenClaw** proved an AI assistant can handle 12 channels and 100+ skills. But it costs 100MB and 400K lines. **NanoClaw** proved security-first is possible. But it's still 50MB of TypeScript. **NemoClaw** proved managed guardrails matter — policy-gated sandboxes, routed inference, credential injection, channel messaging, and digest-verified blueprints. But it is a Docker/k3s stack around OpenClaw with a ~2.4GB compressed sandbox image. **PicoClaw** proved AI assistants can run on $10 hardware. But it stripped out everything to get there.
 
 **ZeptoClaw** took notes. The integrations, the security, the governance, the size discipline — without the tradeoffs each one made. One 6MB Rust binary that starts in 50ms, uses 6MB of RAM, and ships with container isolation, prompt injection detection, and a circuit breaker provider stack.
 
 | | OpenClaw | NemoClaw | NanoClaw | PicoClaw | **ZeptoClaw** |
 |---|---|---|---|---|---|
-| **Size** | ~100MB | ~2GB (Docker) | ~50MB | <1MB | **~6MB** |
-| **Language** | JS/TS | JS/TS/Python | TypeScript | Go | **Rust** |
-| **Built-in tools** | 100+ skills | 0 (inference only) | ~20 | ~5 | **33** |
-| **Providers** | 5 | NVIDIA-first | 3 | 2 | **16** |
-| **Channels** | 12 | 0 (uses OpenClaw) | 3 | 0 | **11** |
-| **Sandbox** | None | Landlock + seccomp | Basic | None | **6 runtimes** |
+| **Size** | ~100MB | ~2.4GB sandbox image + Docker/k3s | ~50MB | <1MB | **~6MB** |
+| **Language** | JS/TS | TypeScript + Python | TypeScript | Go | **Rust** |
+| **Built-in tools** | 100+ skills | OpenClaw tools in sandbox | ~20 | ~5 | **33** |
+| **Providers** | 5 | Multiple routed providers | 3 | 2 | **16** |
+| **Channels** | 12 | Telegram/Discord/Slack via OpenShell | 3 | 0 | **11** |
+| **Sandbox** | None | OpenShell: Landlock + seccomp + netns | Basic | None | **6 runtimes** |
 | **Runs on $10 HW** | No | No (needs GPU) | No | Yes | **Yes** |
 
 ## Security
@@ -272,7 +272,7 @@ Any provider's base URL can be overridden with `api_base` for proxies or self-ho
 
 ## Inspired By
 
-ZeptoClaw is inspired by projects in the open-source AI agent ecosystem — OpenClaw, NemoClaw, NanoClaw, and PicoClaw — each taking a different approach to the same problem. NemoClaw's declarative policy model and digest-verified supply chain influenced our security thinking. ZeptoClaw's contribution is Rust's memory safety, async performance, and container isolation for production multi-tenant deployments — all in a 6MB binary that runs where Docker containers can't.
+ZeptoClaw is inspired by projects in the open-source AI agent ecosystem — OpenClaw, NemoClaw, NanoClaw, and PicoClaw — each taking a different approach to the same problem. NemoClaw's policy model, routed inference, credential boundary, and digest-verified blueprint flow influenced our security thinking. ZeptoClaw's contribution is Rust's memory safety, async performance, and configurable isolation for local-first, edge, and production multi-tenant deployments — all in a 6MB binary that runs where Docker containers can't.
 
 ## Usage
 
@@ -315,7 +315,7 @@ See [CLAUDE.md](CLAUDE.md) for full architecture reference, [AGENTS.md](AGENTS.m
 
 ## Zepto Stack
 
-ZeptoClaw is part of the Zepto stack — a modular system for running AI agents in production.
+ZeptoClaw is part of the Zepto stack — a modular local-first system for running on-device AI agents in production.
 
 ```
 ZeptoPM        — orchestration, supervision, retries, job lifecycle
@@ -336,7 +336,7 @@ ZeptoClaw      — LLM calls, tool use, artifact production
 | **ZeptoPM** | [qhkm/zeptopm](https://github.com/qhkm/zeptopm) | Process manager — config-driven daemon, HTTP API, pipelines, orchestration |
 | **ZeptoCapsule** | [qhkm/zeptocapsule](https://github.com/qhkm/zeptocapsule) | Sandbox — process/namespace/Firecracker isolation, resource limits, fallback chains |
 | **ZeptoRT** | [qhkm/zeptort](https://github.com/qhkm/zeptort) | Durable runtime — journaled effects, snapshot recovery, OTP-style supervision |
-| **ZeptoClaw** | [qhkm/zeptoclaw](https://github.com/qhkm/zeptoclaw) | Agent framework — 33 tools, 16 providers, 11 channels, container isolation |
+| **ZeptoClaw** | [qhkm/zeptoclaw](https://github.com/qhkm/zeptoclaw) | Personal AI assistant infrastructure — tools, memory, providers, channels, sandboxed autonomy |
 
 ## Contributing
 
@@ -358,7 +358,7 @@ ZeptoClaw is a pure open-source software project. It has no token, no cryptocurr
 ---
 
 <p align="center">
-  <em>ZeptoClaw — Because your AI assistant shouldn't need more RAM than your text editor.</em>
+  <em>ZeptoClaw — Local-first personal AI assistant infrastructure in one Rust binary.</em>
 </p>
 <p align="center">
   Built by <a href="https://aisar.ai">Aisar Labs</a>
