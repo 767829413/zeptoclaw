@@ -66,6 +66,7 @@ const TOOL_CALL_EVENT_NAME: &str = "ui:tool_call";
 const ACP_HTTP_CHANNEL: &str = "acp_http";
 const ACP_STDIO_CHANNEL: &str = "acp";
 static THINKING_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
+static FILE_ARTIFACT_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn supports_custom_ui_channel(channel: &str) -> bool {
     channel == ACP_HTTP_CHANNEL || channel == ACP_STDIO_CHANNEL
@@ -93,6 +94,7 @@ struct FileArtifactCandidate {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileArtifactPayload {
+    event_id: String,
     path: String,
     name: String,
     size_bytes: u64,
@@ -120,6 +122,8 @@ struct ToolCallStatusPayload {
     elapsed_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_preview: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +228,10 @@ fn build_file_artifact_payload(
         }
     };
     Some(FileArtifactPayload {
+        event_id: format!(
+            "file_{}",
+            FILE_ARTIFACT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
         path: relative,
         name,
         size_bytes: metadata.len(),
@@ -316,6 +324,7 @@ async fn publish_tool_call_status_event(
     status: &'static str,
     elapsed_ms: Option<u64>,
     error: Option<&str>,
+    result_preview: Option<&str>,
 ) {
     let payload = ToolCallStatusPayload {
         tool_call_id: tool_call_id.to_string(),
@@ -323,6 +332,7 @@ async fn publish_tool_call_status_event(
         status,
         elapsed_ms,
         error: error.map(ToString::to_string),
+        result_preview: result_preview.map(ToString::to_string),
     };
     let summary = match status {
         "started" => Some(format!("[tool] {} started", tool_name)),
@@ -345,6 +355,18 @@ async fn publish_tool_call_status_event(
         summary.as_deref(),
     )
     .await;
+}
+
+fn build_tool_result_preview(result: &str) -> Option<String> {
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut preview = truncate_utf8(trimmed, 2000).to_string();
+    if preview.len() < trimmed.len() {
+        preview.push_str("\n...");
+    }
+    Some(preview)
 }
 
 type ApprovalFuture = Pin<Box<dyn Future<Output = ApprovalResponse> + Send>>;
@@ -1836,6 +1858,7 @@ impl AgentLoop {
                             "started",
                             None,
                             None,
+                            None,
                         )
                         .await;
                         #[cfg(feature = "panel")]
@@ -1922,6 +1945,9 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            let result_preview = build_tool_result_preview(
+                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
+                            );
                             publish_tool_call_status_event(
                                 &bus_for_tools,
                                 &ctx,
@@ -1930,6 +1956,7 @@ impl AgentLoop {
                                 "done",
                                 Some(latency_ms),
                                 None,
+                                result_preview.as_deref(),
                             )
                             .await;
                             #[cfg(feature = "panel")]
@@ -1955,6 +1982,9 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            let result_preview = build_tool_result_preview(
+                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
+                            );
                             publish_tool_call_status_event(
                                 &bus_for_tools,
                                 &ctx,
@@ -1963,6 +1993,7 @@ impl AgentLoop {
                                 "failed",
                                 Some(latency_ms),
                                 Some(&result),
+                                result_preview.as_deref(),
                             )
                             .await;
                             #[cfg(feature = "panel")]
@@ -2836,6 +2867,7 @@ impl AgentLoop {
                             "started",
                             None,
                             None,
+                            None,
                         )
                         .await;
                         #[cfg(feature = "panel")]
@@ -2921,6 +2953,9 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            let result_preview = build_tool_result_preview(
+                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
+                            );
                             publish_tool_call_status_event(
                                 &bus_for_tools,
                                 &ctx,
@@ -2929,6 +2964,7 @@ impl AgentLoop {
                                 "done",
                                 Some(latency_ms),
                                 None,
+                                result_preview.as_deref(),
                             )
                             .await;
                             #[cfg(feature = "panel")]
@@ -2954,6 +2990,9 @@ impl AgentLoop {
                                     args_json: Some(raw_args.clone()),
                                 });
                             }
+                            let result_preview = build_tool_result_preview(
+                                &crate::utils::sanitize::sanitize_tool_result(&result, budget),
+                            );
                             publish_tool_call_status_event(
                                 &bus_for_tools,
                                 &ctx,
@@ -2962,6 +3001,7 @@ impl AgentLoop {
                                 "failed",
                                 Some(latency_ms),
                                 Some(&result),
+                                result_preview.as_deref(),
                             )
                             .await;
                             #[cfg(feature = "panel")]
