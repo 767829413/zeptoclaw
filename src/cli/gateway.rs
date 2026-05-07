@@ -324,18 +324,18 @@ pub(crate) async fn cmd_gateway(
                     else {
                         return false;
                     };
+                    if !request_id.is_empty() && !broker.has_pending(&msg.chat_id) {
+                        return false;
+                    }
                     if all {
-                        if !broker.has_pending_request(&msg.chat_id, request_id) {
-                            return false;
-                        }
                         broker.resolve_all(&msg.chat_id, approved) > 0
                     } else {
-                        broker.resolve(&msg.chat_id, request_id, approved)
+                        broker.resolve(&msg.chat_id, approved)
                     }
                 }
                 Some(_) => false,
                 None if all => broker.resolve_all(&msg.chat_id, approved) > 0,
-                None => broker.resolve_oldest(&msg.chat_id, approved),
+                None => broker.resolve(&msg.chat_id, approved),
             }
         }) as InboundInterceptor
     });
@@ -748,7 +748,7 @@ async fn register_approval_handler(
                 };
 
                 let request_id = ulid::Ulid::new().to_string();
-                let rx = broker.register(&chat_id, &request_id);
+                let rx = broker.register(&chat_id);
 
                 // Format the approval prompt. Shell commands get a clean code-block
                 // display; other tools show pretty-printed JSON arguments.

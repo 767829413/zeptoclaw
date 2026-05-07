@@ -329,6 +329,10 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 name = "message_bus"
 harness = false
 
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
+
 [profile.test]
 opt-level = 1
 

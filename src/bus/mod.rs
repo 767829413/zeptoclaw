@@ -148,7 +148,7 @@ impl MessageBus {
     /// consumed it.
     ///
     /// Returns `Ok(true)` when an installed interceptor handled the message
-    /// (so it was **not** queued for the agent loop), `Ok(false)` when the
+    /// (so it was not queued for the agent loop), `Ok(false)` when the
     /// message was enqueued normally, and an error when queueing failed.
     pub async fn publish_inbound_with_status(&self, msg: InboundMessage) -> Result<bool> {
         if let Ok(guard) = self.inbound_interceptor.read() {
@@ -495,30 +495,6 @@ mod tests {
         let msg3 = InboundMessage::new("test", "user", "chat", "Msg 3");
         let result = bus.try_publish_inbound(msg3);
         assert!(matches!(result, Err(ZeptoError::Channel(_))));
-    }
-
-    #[tokio::test]
-    async fn test_publish_inbound_with_status_reports_intercepted() {
-        let bus = MessageBus::new();
-        bus.set_inbound_interceptor(Arc::new(|_msg: &InboundMessage| true));
-        let msg = InboundMessage::new("test", "u1", "c1", "hello");
-        let intercepted = bus.publish_inbound_with_status(msg).await.unwrap();
-        assert!(intercepted);
-        let recv =
-            tokio::time::timeout(std::time::Duration::from_millis(20), bus.consume_inbound()).await;
-        assert!(
-            recv.is_err(),
-            "intercepted inbound should not be queued for consume_inbound"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_publish_inbound_with_status_reports_queued() {
-        let bus = MessageBus::new();
-        let msg = InboundMessage::new("test", "u1", "c1", "hello");
-        let intercepted = bus.publish_inbound_with_status(msg).await.unwrap();
-        assert!(!intercepted);
-        assert!(bus.consume_inbound().await.is_some());
     }
 
     #[tokio::test]

@@ -523,6 +523,15 @@ fn parse_mermaid_quoted_value(raw: &str) -> Option<String> {
     Some(rest[..second].to_string())
 }
 
+fn resolve_streamed_response_text(delta_accum: &str, done_content: &str) -> String {
+    let done_trimmed = done_content.trim();
+    if done_trimmed.is_empty() {
+        delta_accum.to_string()
+    } else {
+        done_content.to_string()
+    }
+}
+
 fn parse_mermaid_xychart_spec(content: &str) -> Option<MermaidXyChartSpec> {
     if !content.contains("xychart-beta") {
         return None;
@@ -570,6 +579,44 @@ fn parse_mermaid_xychart_spec(content: &str) -> Option<MermaidXyChartSpec> {
         values,
         y_max,
     })
+}
+
+fn strip_mermaid_xychart_block(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("xychart-beta"))
+    else {
+        return content.to_string();
+    };
+
+    let mut end = start + 1;
+    while end < lines.len() {
+        let raw = lines[end];
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            end += 1;
+            break;
+        }
+        if raw.starts_with(' ')
+            || raw.starts_with('\t')
+            || trimmed.starts_with("title ")
+            || trimmed.starts_with("x-axis ")
+            || trimmed.starts_with("y-axis ")
+            || trimmed.starts_with("bar ")
+            || trimmed.starts_with("line ")
+            || trimmed.starts_with("scatter ")
+        {
+            end += 1;
+            continue;
+        }
+        break;
+    }
+
+    let mut kept = Vec::with_capacity(lines.len());
+    kept.extend_from_slice(&lines[..start]);
+    kept.extend_from_slice(&lines[end..]);
+    kept.join("\n").trim().to_string()
 }
 
 fn build_a2ui_messages_from_mermaid_xychart(spec: &MermaidXyChartSpec) -> Vec<serde_json::Value> {
@@ -692,10 +739,11 @@ fn extract_a2ui_messages_from_response(content: &str) -> (String, Vec<serde_json
         cleaned.push_str(&content[cursor..]);
     }
 
-    let cleaned = cleaned.trim().to_string();
+    let mut cleaned = cleaned.trim().to_string();
     if messages.is_empty() {
         if let Some(spec) = parse_mermaid_xychart_spec(&cleaned) {
             messages = build_a2ui_messages_from_mermaid_xychart(&spec);
+            cleaned = strip_mermaid_xychart_block(&cleaned);
         }
     }
     (cleaned, messages)
@@ -4098,11 +4146,13 @@ impl AgentLoop {
             let mut rx = self.process_message_streaming(msg).await?;
             let mut had_delta = false;
             let mut final_content = String::new();
+            let mut streamed_content = String::new();
 
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::Delta(text) => {
                         had_delta = true;
+                        streamed_content.push_str(&text);
                         let mut chunk = OutboundMessage::new(&msg.channel, &msg.chat_id, &text)
                             .with_kind(OutboundMessageKind::Chunk);
                         propagate_routing_metadata(&mut chunk, msg);
@@ -4111,7 +4161,7 @@ impl AgentLoop {
                         }
                     }
                     StreamEvent::Done { content, .. } => {
-                        final_content = content;
+                        final_content = resolve_streamed_response_text(&streamed_content, &content);
                         break;
                     }
                     StreamEvent::ToolCalls(_) => {
@@ -4674,7 +4724,7 @@ xychart-beta
   bar [10,20,30]
 "#;
         let (cleaned, messages) = extract_a2ui_messages_from_response(raw);
-        assert!(cleaned.contains("xychart-beta"));
+        assert_eq!(cleaned, "");
         assert_eq!(messages.len(), 2, "should emit create+update A2UI messages");
         assert!(messages
             .iter()
@@ -4682,6 +4732,38 @@ xychart-beta
         assert!(messages
             .iter()
             .any(|msg| msg.get("updateComponents").is_some()), "missing updateComponents");
+    }
+
+    #[test]
+    fn test_extract_a2ui_messages_from_response_removes_mermaid_xychart_block_only() {
+        let raw = r#"
+intro line
+
+xychart-beta
+  title "Fallback chart"
+  x-axis ["A","B","C"]
+  bar [10,20,30]
+
+tail line
+"#;
+        let (cleaned, messages) = extract_a2ui_messages_from_response(raw);
+        assert_eq!(messages.len(), 2, "should emit create+update A2UI messages");
+        assert!(cleaned.contains("intro line"));
+        assert!(cleaned.contains("tail line"));
+        assert!(!cleaned.contains("xychart-beta"));
+    }
+
+    #[test]
+    fn test_resolve_streamed_response_text_uses_delta_when_done_is_empty() {
+        let resolved = resolve_streamed_response_text("xychart-beta\nbar [1,2,3]\n", "   ");
+        assert!(resolved.contains("xychart-beta"));
+        assert!(resolved.contains("bar [1,2,3]"));
+    }
+
+    #[test]
+    fn test_resolve_streamed_response_text_prefers_done_content_when_present() {
+        let resolved = resolve_streamed_response_text("chunk-a chunk-b", "final body");
+        assert_eq!(resolved, "final body");
     }
 
     #[test]
