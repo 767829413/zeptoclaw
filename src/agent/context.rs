@@ -50,7 +50,9 @@ Rules:
 - Use A2UI v0.9 message objects.
 - The `a2ui` block must contain valid JSON only (no comments).
 - You can output one message object, an array of message objects, or `{"messages":[...]}`.
-- Prefer concise/no extra prose when the user only wants rendered UI."#;
+- For chart requests, prefer `createSurface` + `updateComponents` messages using the basic catalog.
+- Do NOT output Mermaid (`xychart-beta`, `graph TD`), markdown chart syntax, or Python chart code unless the user explicitly asks for code.
+- If the user only asks for rendered UI, output the `a2ui` block only (no extra prose)."#;
 
 /// System prompt suffix for first-run persona guidance.
 // Wired in by the persona override extraction task (common.rs); suppress
@@ -1145,6 +1147,18 @@ mod tests {
         assert!(
             DEFAULT_SYSTEM_PROMPT.contains("HEARTBEAT_OK"),
             "System prompt must instruct how to handle heartbeat messages"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_contains_a2ui_guidance() {
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("A2UI"),
+            "System prompt must include A2UI rendering guidance"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("Do NOT output Mermaid"),
+            "System prompt must discourage Mermaid fallback for UI rendering requests"
         );
     }
 

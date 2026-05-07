@@ -65,6 +65,7 @@ const ACP_HTTP_CHANNEL: &str = "acp_http";
 const ACP_STDIO_CHANNEL: &str = "acp";
 static THINKING_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 static FILE_ARTIFACT_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
+static A2UI_SURFACE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn supports_custom_ui_channel(channel: &str) -> bool {
     channel == ACP_HTTP_CHANNEL || channel == ACP_STDIO_CHANNEL
@@ -483,6 +484,173 @@ fn parse_a2ui_messages_block(raw_block: &str) -> Option<Vec<serde_json::Value>> 
     normalize_a2ui_payload(parsed)
 }
 
+#[derive(Debug)]
+struct MermaidXyChartSpec {
+    title: Option<String>,
+    labels: Vec<String>,
+    values: Vec<u64>,
+    y_max: u64,
+}
+
+fn parse_mermaid_array_str(raw: &str) -> Vec<String> {
+    let start = match raw.find('[') {
+        Some(idx) => idx + 1,
+        None => return Vec::new(),
+    };
+    let end = match raw[start..].find(']') {
+        Some(idx) => start + idx,
+        None => return Vec::new(),
+    };
+    raw[start..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim_matches('"').trim_matches('\'').to_string())
+        .collect()
+}
+
+fn parse_mermaid_array_u64(raw: &str) -> Vec<u64> {
+    parse_mermaid_array_str(raw)
+        .into_iter()
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn parse_mermaid_quoted_value(raw: &str) -> Option<String> {
+    let first = raw.find('"')?;
+    let rest = &raw[(first + 1)..];
+    let second = rest.find('"')?;
+    Some(rest[..second].to_string())
+}
+
+fn parse_mermaid_xychart_spec(content: &str) -> Option<MermaidXyChartSpec> {
+    if !content.contains("xychart-beta") {
+        return None;
+    }
+    let mut title: Option<String> = None;
+    let mut labels: Vec<String> = Vec::new();
+    let mut values: Vec<u64> = Vec::new();
+    let mut y_max: Option<u64> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("title ") {
+            title = parse_mermaid_quoted_value(trimmed);
+            continue;
+        }
+        if trimmed.starts_with("x-axis ") {
+            labels = parse_mermaid_array_str(trimmed);
+            continue;
+        }
+        if trimmed.starts_with("bar ") {
+            values = parse_mermaid_array_u64(trimmed);
+            continue;
+        }
+        if trimmed.starts_with("y-axis ") {
+            if let Some(marker) = trimmed.find("-->") {
+                let upper = trimmed[(marker + 3)..].trim();
+                y_max = upper.parse::<u64>().ok();
+            }
+            continue;
+        }
+    }
+
+    if values.is_empty() {
+        return None;
+    }
+    if labels.len() != values.len() {
+        labels = (1..=values.len()).map(|idx| format!("Item {}", idx)).collect();
+    }
+    let computed_max = values.iter().copied().max().unwrap_or(1).max(1);
+    let y_max = y_max.unwrap_or(computed_max).max(computed_max);
+
+    Some(MermaidXyChartSpec {
+        title,
+        labels,
+        values,
+        y_max,
+    })
+}
+
+fn build_a2ui_messages_from_mermaid_xychart(spec: &MermaidXyChartSpec) -> Vec<serde_json::Value> {
+    let surface_id = format!("chart_{}", A2UI_SURFACE_SEQ.fetch_add(1, Ordering::Relaxed));
+    let mut components: Vec<serde_json::Value> = Vec::new();
+    let mut row_ids: Vec<String> = Vec::new();
+
+    components.push(serde_json::json!({
+        "id": "root",
+        "component": "Column",
+        "children": ["title", "bars"],
+        "align": "stretch"
+    }));
+    components.push(serde_json::json!({
+        "id": "title",
+        "component": "Text",
+        "variant": "h3",
+        "text": spec.title.clone().unwrap_or_else(|| "Chart".to_string())
+    }));
+
+    for (idx, (label, value)) in spec.labels.iter().zip(spec.values.iter()).enumerate() {
+        let row_id = format!("row_{}", idx + 1);
+        let label_id = format!("label_{}", idx + 1);
+        let slider_id = format!("bar_{}", idx + 1);
+        let value_id = format!("value_{}", idx + 1);
+        row_ids.push(row_id.clone());
+
+        components.push(serde_json::json!({
+            "id": row_id,
+            "component": "Row",
+            "children": [label_id, slider_id, value_id],
+            "align": "center",
+            "justify": "spaceBetween",
+        }));
+        components.push(serde_json::json!({
+            "id": label_id,
+            "component": "Text",
+            "variant": "caption",
+            "text": label,
+        }));
+        components.push(serde_json::json!({
+            "id": slider_id,
+            "component": "Slider",
+            "label": label,
+            "min": 0,
+            "max": spec.y_max,
+            "value": (*value).min(spec.y_max),
+        }));
+        components.push(serde_json::json!({
+            "id": value_id,
+            "component": "Text",
+            "variant": "caption",
+            "text": value.to_string(),
+        }));
+    }
+
+    components.push(serde_json::json!({
+        "id": "bars",
+        "component": "Column",
+        "children": row_ids,
+        "align": "stretch"
+    }));
+
+    vec![
+        serde_json::json!({
+            "version": "v0.9",
+            "createSurface": {
+                "surfaceId": surface_id,
+                "catalogId": "https://a2ui.org/specification/v0_9/basic_catalog.json"
+            }
+        }),
+        serde_json::json!({
+            "version": "v0.9",
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": components
+            }
+        }),
+    ]
+}
+
 fn extract_a2ui_messages_from_response(content: &str) -> (String, Vec<serde_json::Value>) {
     let mut cleaned = String::with_capacity(content.len());
     let mut messages = Vec::new();
@@ -524,7 +692,13 @@ fn extract_a2ui_messages_from_response(content: &str) -> (String, Vec<serde_json
         cleaned.push_str(&content[cursor..]);
     }
 
-    (cleaned.trim().to_string(), messages)
+    let cleaned = cleaned.trim().to_string();
+    if messages.is_empty() {
+        if let Some(spec) = parse_mermaid_xychart_spec(&cleaned) {
+            messages = build_a2ui_messages_from_mermaid_xychart(&spec);
+        }
+    }
+    (cleaned, messages)
 }
 
 async fn emit_a2ui_messages(
@@ -4473,6 +4647,41 @@ not-json
 "#;
         let (_cleaned, messages) = extract_a2ui_messages_from_response(raw);
         assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_mermaid_xychart_spec_extracts_axes_and_values() {
+        let raw = r#"
+xychart-beta
+  title "Random Bars"
+  x-axis ["A","B","C"]
+  y-axis "Value" 0 --> 100
+  bar [12,35,28]
+"#;
+        let spec = parse_mermaid_xychart_spec(raw).expect("spec");
+        assert_eq!(spec.title.as_deref(), Some("Random Bars"));
+        assert_eq!(spec.labels, vec!["A", "B", "C"]);
+        assert_eq!(spec.values, vec![12, 35, 28]);
+        assert_eq!(spec.y_max, 100);
+    }
+
+    #[test]
+    fn test_extract_a2ui_messages_from_response_falls_back_to_mermaid_xychart() {
+        let raw = r#"
+xychart-beta
+  title "Fallback chart"
+  x-axis ["A","B","C"]
+  bar [10,20,30]
+"#;
+        let (cleaned, messages) = extract_a2ui_messages_from_response(raw);
+        assert!(cleaned.contains("xychart-beta"));
+        assert_eq!(messages.len(), 2, "should emit create+update A2UI messages");
+        assert!(messages
+            .iter()
+            .any(|msg| msg.get("createSurface").is_some()), "missing createSurface");
+        assert!(messages
+            .iter()
+            .any(|msg| msg.get("updateComponents").is_some()), "missing updateComponents");
     }
 
     #[test]
