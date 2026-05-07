@@ -434,6 +434,7 @@ fn build_thinking_detail(response: &LLMResponse) -> Option<String> {
     if content.is_empty() {
         return None;
     }
+
     let merged = format!("Model draft:\n{}", content);
     let mut detail = truncate_utf8(&merged, 8000).to_string();
     if detail.len() < merged.len() {
@@ -4273,6 +4274,30 @@ mod tests {
             }
         }
         panic!("stream ended without a Done event");
+    }
+
+    #[test]
+    fn test_build_thinking_detail_includes_model_draft() {
+        let response = LLMResponse::text("draft answer");
+        let detail = build_thinking_detail(&response).expect("detail expected");
+        assert!(detail.contains("Model draft:"));
+        assert!(detail.contains("draft answer"));
+    }
+
+    #[test]
+    fn test_build_thinking_detail_without_model_draft_returns_none() {
+        let response = LLMResponse::with_tools(
+            "",
+            vec![LLMToolCall::new(
+                "call_1",
+                "write_file",
+                r#"{"path":"random_string.py","content":"print(1)"}"#,
+            )],
+        );
+        assert!(
+            build_thinking_detail(&response).is_none(),
+            "tool-only response should not be shown as thought detail"
+        );
     }
 
     #[test]
