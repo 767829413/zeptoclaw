@@ -42,6 +42,16 @@ You have an ask_clarification tool. When facing ambiguity, use it instead of gue
 - Ambiguous requirements that could be interpreted different ways
 Do not over-use it for trivial decisions you can make yourself.
 
+## Visual Rendering (text-only channel)
+
+This channel cannot render rich UI. When asked for a chart / plot / histogram / dashboard, reply with a concise text description plus a small markdown table when it helps. Do NOT emit JSON UI payloads, mermaid blocks, or Python plotting code unless the user explicitly asks for the code."#;
+
+/// Optional system prompt segment appended only when the active channel can
+/// render A2UI surfaces (e.g. the Tauri client over `acp_http`). Channels
+/// without a renderer (Discord / Telegram / WhatsApp / CLI) skip this so the
+/// model does not produce raw JSON the user would see verbatim.
+const A2UI_RENDERING_PROMPT_SUFFIX: &str = r#"
+
 ## A2UI Rendering (HARD RULE)
 
 When the user asks for visual rendering in chat (chart, plot, histogram, bar / line / pie chart, form, dashboard, table, card, etc.), you MUST render it inline using an A2UI v0.9 payload. Do NOT use the shell tool, the write tool, or any other tool to generate image / SVG / HTML / Python code for these requests. Tools are reserved for tasks the user explicitly asks to be saved as a file.
@@ -281,6 +291,23 @@ impl RuntimeContext {
     }
 }
 
+/// Per-message prompt capabilities decided by the caller (typically the
+/// agent loop) based on the inbound channel. Sections of the system prompt
+/// that depend on a renderer (e.g. A2UI surfaces) are gated on these flags
+/// so non-rendering channels do not see them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptCapabilities {
+    /// True when the active channel can render A2UI v0.9 surfaces.
+    pub a2ui_capable: bool,
+}
+
+impl PromptCapabilities {
+    /// Convenience constructor for the A2UI-capable variant.
+    pub fn with_a2ui() -> Self {
+        Self { a2ui_capable: true }
+    }
+}
+
 /// Builder for constructing conversation context for LLM calls.
 ///
 /// The `ContextBuilder` helps construct the full message list including
@@ -497,17 +524,23 @@ impl ContextBuilder {
         Message::system(&content)
     }
 
-    /// Build system message with an optional memory context override.
-    ///
-    /// When `memory_override` is `Some`, it replaces the stored
-    /// `memory_context`. `Some("")` suppresses memory injection.
-    fn build_system_message_with_memory_override(&self, memory_override: Option<&str>) -> Message {
+    /// Internal builder that supports both memory override and channel
+    /// capability gating (e.g. the A2UI suffix is only injected when the
+    /// caller signals the channel can render A2UI surfaces).
+    fn build_system_message_with_overrides(
+        &self,
+        memory_override: Option<&str>,
+        caps: PromptCapabilities,
+    ) -> Message {
         let mut content = String::new();
         if let Some(ref soul) = self.soul_prompt {
             content.push_str(soul);
             content.push_str("\n\n");
         }
         content.push_str(&self.system_prompt);
+        if caps.a2ui_capable {
+            content.push_str(A2UI_RENDERING_PROMPT_SUFFIX);
+        }
         if let Some(ref skills) = self.skills_prompt {
             content.push_str("\n\n## Available Skills\n\n");
             content.push_str(skills);
@@ -590,7 +623,26 @@ impl ContextBuilder {
         user_input: &str,
         memory_override: Option<&str>,
     ) -> Vec<Message> {
-        let mut messages = vec![self.build_system_message_with_memory_override(memory_override)];
+        self.build_messages_with_overrides(
+            history,
+            user_input,
+            memory_override,
+            PromptCapabilities::default(),
+        )
+    }
+
+    /// Build the full message list, gating channel-specific prompt sections
+    /// (currently the A2UI rendering suffix) on `caps`. The agent loop sets
+    /// `caps.a2ui_capable` based on the channel of the inbound message so
+    /// non-A2UI channels (Discord, CLI, ...) never see the A2UI guidance.
+    pub fn build_messages_with_overrides(
+        &self,
+        history: &[Message],
+        user_input: &str,
+        memory_override: Option<&str>,
+        caps: PromptCapabilities,
+    ) -> Vec<Message> {
+        let mut messages = vec![self.build_system_message_with_overrides(memory_override, caps)];
         messages.extend(history.iter().cloned());
         if !user_input.is_empty() {
             let content = if let Some(ref ctx) = self.runtime_context {
@@ -1178,23 +1230,83 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_contains_a2ui_guidance() {
+    fn test_a2ui_suffix_contains_full_guidance() {
         assert!(
-            DEFAULT_SYSTEM_PROMPT.contains("A2UI"),
-            "System prompt must include A2UI rendering guidance"
+            A2UI_RENDERING_PROMPT_SUFFIX.contains("A2UI"),
+            "A2UI suffix must include rendering guidance"
         );
         assert!(
-            DEFAULT_SYSTEM_PROMPT.contains("Do NOT output Mermaid"),
-            "System prompt must discourage Mermaid fallback for UI rendering requests"
+            A2UI_RENDERING_PROMPT_SUFFIX.contains("Do NOT output Mermaid"),
+            "A2UI suffix must discourage Mermaid fallback for UI rendering requests"
         );
         assert!(
-            DEFAULT_SYSTEM_PROMPT.contains("```a2ui"),
-            "System prompt must include a copy-paste-ready ```a2ui example"
+            A2UI_RENDERING_PROMPT_SUFFIX.contains("```a2ui"),
+            "A2UI suffix must include a copy-paste-ready ```a2ui example"
         );
         assert!(
-            DEFAULT_SYSTEM_PROMPT.contains("Do NOT call `shell`"),
-            "System prompt must forbid using shell/python tools to render charts"
+            A2UI_RENDERING_PROMPT_SUFFIX.contains("Do NOT call `shell`"),
+            "A2UI suffix must forbid using shell/python tools to render charts"
         );
+    }
+
+    #[test]
+    fn test_default_prompt_excludes_a2ui_guidance() {
+        // A2UI guidance is gated per-channel; the always-on default must
+        // never carry it so non-rendering channels (Discord/CLI/etc) don't
+        // receive instructions that would make the model emit raw JSON.
+        assert!(
+            !DEFAULT_SYSTEM_PROMPT.contains("```a2ui"),
+            "Default prompt must not contain the A2UI block — gate it on capability instead"
+        );
+        assert!(
+            !DEFAULT_SYSTEM_PROMPT.contains("A2UI Rendering (HARD RULE)"),
+            "Default prompt must not contain the HARD RULE A2UI section"
+        );
+    }
+
+    #[test]
+    fn test_default_prompt_keeps_text_only_visual_guidance() {
+        // Non-A2UI channels still need a hint to fall back to plain text /
+        // markdown table rather than emitting JSON or mermaid.
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("text-only channel"),
+            "Default prompt must include the text-only visual rendering note"
+        );
+    }
+
+    #[test]
+    fn test_build_messages_with_a2ui_capability_includes_suffix() {
+        let builder = ContextBuilder::new();
+        let messages = builder.build_messages_with_overrides(
+            &[],
+            "draw a chart",
+            None,
+            PromptCapabilities::with_a2ui(),
+        );
+        assert!(messages[0].content.contains("```a2ui"));
+        assert!(messages[0].content.contains("A2UI Rendering (HARD RULE)"));
+    }
+
+    #[test]
+    fn test_build_messages_without_capability_omits_suffix() {
+        let builder = ContextBuilder::new();
+        let messages = builder.build_messages_with_overrides(
+            &[],
+            "draw a chart",
+            None,
+            PromptCapabilities::default(),
+        );
+        assert!(!messages[0].content.contains("```a2ui"));
+        assert!(!messages[0].content.contains("A2UI Rendering (HARD RULE)"));
+    }
+
+    #[test]
+    fn test_legacy_build_messages_with_memory_override_omits_a2ui() {
+        // Backwards-compatibility: callers that don't opt in must default
+        // to a2ui_capable=false so non-rendering channels stay clean.
+        let builder = ContextBuilder::new();
+        let messages = builder.build_messages_with_memory_override(&[], "Hello", None);
+        assert!(!messages[0].content.contains("```a2ui"));
     }
 
     #[test]

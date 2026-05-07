@@ -35,7 +35,7 @@ use crate::tools::{Tool, ToolCategory, ToolContext, ToolRegistry};
 use crate::utils::metrics::MetricsCollector;
 
 use super::budget::TokenBudget;
-use super::context::ContextBuilder;
+use super::context::{ContextBuilder, PromptCapabilities};
 use super::tool_call_limit::ToolCallLimitTracker;
 
 /// System prompt sent during the memory flush turn, instructing the LLM to
@@ -1887,7 +1887,7 @@ impl AgentLoop {
         // entry here.
         let memory_override = self.build_memory_override(&resolved_user_prompt).await;
         let mut messages = self
-            .build_resolved_messages(&session, memory_override.as_deref())
+            .build_resolved_messages(msg, &session, memory_override.as_deref())
             .await;
 
         // Get tool definitions (short-lived read lock)
@@ -1919,7 +1919,7 @@ impl AgentLoop {
                         );
                     session.messages = recovered;
                     messages = self
-                        .build_resolved_messages(&session, memory_override.as_deref())
+                        .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
                 }
             }
@@ -2022,7 +2022,7 @@ impl AgentLoop {
                 );
                 session.messages = recovered;
                 last_messages = self
-                    .build_resolved_messages(&session, memory_override.as_deref())
+                    .build_resolved_messages(msg, &session, memory_override.as_deref())
                     .await;
                 last_tool_defs = {
                     let tools = self.tools.read().await;
@@ -2534,7 +2534,7 @@ impl AgentLoop {
                     break;
                 }
                 let mut messages = self
-                    .build_resolved_messages(&session, memory_override.as_deref())
+                    .build_resolved_messages(msg, &session, memory_override.as_deref())
                     .await;
                 // Pre-flight guard for synthesis call
                 if let Some(ref monitor) = self.context_monitor {
@@ -2554,7 +2554,7 @@ impl AgentLoop {
                             );
                         session.messages = recovered;
                         messages = self
-                            .build_resolved_messages(&session, memory_override.as_deref())
+                            .build_resolved_messages(msg, &session, memory_override.as_deref())
                             .await;
                     }
                 }
@@ -2591,7 +2591,7 @@ impl AgentLoop {
                             );
                         session.messages = recovered;
                         last_messages = self
-                            .build_resolved_messages(&session, memory_override.as_deref())
+                            .build_resolved_messages(msg, &session, memory_override.as_deref())
                             .await;
                         result = provider
                             .chat(last_messages.clone(), vec![], model, options.clone())
@@ -2653,7 +2653,7 @@ impl AgentLoop {
 
             // Call LLM again with tool results -- provider lock NOT held
             let mut messages = self
-                .build_resolved_messages(&session, memory_override.as_deref())
+                .build_resolved_messages(msg, &session, memory_override.as_deref())
                 .await;
 
             // Pre-flight context guard (tool loop)
@@ -2679,7 +2679,7 @@ impl AgentLoop {
                             );
                         session.messages = recovered;
                         messages = self
-                            .build_resolved_messages(&session, memory_override.as_deref())
+                            .build_resolved_messages(msg, &session, memory_override.as_deref())
                             .await;
                     }
                 }
@@ -2734,7 +2734,7 @@ impl AgentLoop {
                     );
                     session.messages = recovered;
                     last_messages = self
-                        .build_resolved_messages(&session, memory_override.as_deref())
+                        .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
                     last_tool_defs = {
                         let tools = self.tools.read().await;
@@ -2918,7 +2918,7 @@ impl AgentLoop {
         // Pass an empty user_input: the current user message is already in session.
         let memory_override = self.build_memory_override(&resolved_user_prompt).await;
         let mut messages = self
-            .build_resolved_messages(&session, memory_override.as_deref())
+            .build_resolved_messages(msg, &session, memory_override.as_deref())
             .await;
 
         let tool_definitions = {
@@ -2949,7 +2949,7 @@ impl AgentLoop {
                         );
                     session.messages = recovered;
                     messages = self
-                        .build_resolved_messages(&session, memory_override.as_deref())
+                        .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
                 }
             }
@@ -3019,7 +3019,7 @@ impl AgentLoop {
                 );
                 session.messages = recovered;
                 last_messages = self
-                    .build_resolved_messages(&session, memory_override.as_deref())
+                    .build_resolved_messages(msg, &session, memory_override.as_deref())
                     .await;
                 last_tool_defs = {
                     let tools = self.tools.read().await;
@@ -3537,7 +3537,7 @@ impl AgentLoop {
             }
 
             let mut messages = self
-                .build_resolved_messages(&session, memory_override.as_deref())
+                .build_resolved_messages(msg, &session, memory_override.as_deref())
                 .await;
 
             // Pre-flight context guard (streaming tool loop)
@@ -3563,7 +3563,7 @@ impl AgentLoop {
                             );
                         session.messages = recovered;
                         messages = self
-                            .build_resolved_messages(&session, memory_override.as_deref())
+                            .build_resolved_messages(msg, &session, memory_override.as_deref())
                             .await;
                     }
                 }
@@ -3617,7 +3617,7 @@ impl AgentLoop {
                     );
                     session.messages = recovered;
                     last_messages = self
-                        .build_resolved_messages(&session, memory_override.as_deref())
+                        .build_resolved_messages(msg, &session, memory_override.as_deref())
                         .await;
                     last_tool_defs = {
                         let tools = self.tools.read().await;
@@ -3670,7 +3670,7 @@ impl AgentLoop {
             // If the tool call limit was hit, pass empty tools so the model
             // cannot emit further tool calls after the cap was enforced.
             let messages = self
-                .build_resolved_messages(&session, memory_override.as_deref())
+                .build_resolved_messages(msg, &session, memory_override.as_deref())
                 .await;
 
             let tool_definitions = if tool_limit_hit {
@@ -3887,15 +3887,27 @@ impl AgentLoop {
     /// This centralizes the message preparation logic used in tool loops.
     /// Images are resolved first so that if resolution fails and leaves a
     /// message empty, it will be correctly filtered out.
+    ///
+    /// `msg` is required so the per-channel `PromptCapabilities` (currently
+    /// just `a2ui_capable`) can be derived. Channels that cannot render A2UI
+    /// surfaces (Discord, Telegram, CLI, ...) skip the A2UI prompt suffix so
+    /// the model does not produce raw JSON the user would see verbatim.
     async fn build_resolved_messages(
         &self,
+        msg: &InboundMessage,
         session: &crate::session::Session,
         memory_override: Option<&str>,
     ) -> Vec<Message> {
-        let mut msgs = self.context_builder.build_messages_with_memory_override(
+        let caps = if supports_custom_ui_channel(&msg.channel) {
+            PromptCapabilities::with_a2ui()
+        } else {
+            PromptCapabilities::default()
+        };
+        let mut msgs = self.context_builder.build_messages_with_overrides(
             &session.messages,
             "",
             memory_override,
+            caps,
         );
 
         // Resolve image file paths to base64 before filtering
