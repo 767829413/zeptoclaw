@@ -429,6 +429,123 @@ fn prettify_tool_arguments(raw_args: &str) -> String {
         .unwrap_or_else(|| raw_args.to_string())
 }
 
+fn is_a2ui_message_object(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.contains_key("createSurface")
+        || obj.contains_key("updateComponents")
+        || obj.contains_key("updateDataModel")
+        || obj.contains_key("deleteSurface")
+        || obj.contains_key("beginRendering")
+        || obj.contains_key("surfaceUpdate")
+        || obj.contains_key("dataModelUpdate")
+}
+
+fn normalize_a2ui_payload(value: serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    match value {
+        serde_json::Value::Array(items) => {
+            let messages: Vec<serde_json::Value> =
+                items.into_iter().filter(|item| item.is_object()).collect();
+            if messages.is_empty() {
+                None
+            } else {
+                Some(messages)
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::Array(items)) = obj.get("messages") {
+                let messages: Vec<serde_json::Value> = items
+                    .iter()
+                    .filter(|item| item.is_object())
+                    .cloned()
+                    .collect();
+                if messages.is_empty() {
+                    None
+                } else {
+                    Some(messages)
+                }
+            } else if let Some(serde_json::Value::Object(msg)) = obj.get("message") {
+                Some(vec![serde_json::Value::Object(msg.clone())])
+            } else if is_a2ui_message_object(&obj) {
+                Some(vec![serde_json::Value::Object(obj)])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_a2ui_messages_block(raw_block: &str) -> Option<Vec<serde_json::Value>> {
+    let trimmed = raw_block.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    normalize_a2ui_payload(parsed)
+}
+
+fn extract_a2ui_messages_from_response(content: &str) -> (String, Vec<serde_json::Value>) {
+    let mut cleaned = String::with_capacity(content.len());
+    let mut messages = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(start_rel) = content[cursor..].find("```a2ui") {
+        let start = cursor + start_rel;
+        cleaned.push_str(&content[cursor..start]);
+
+        let header_end = match content[start..].find('\n') {
+            Some(offset) => start + offset + 1,
+            None => {
+                cleaned.push_str(&content[start..]);
+                cursor = content.len();
+                break;
+            }
+        };
+
+        let body_end = match content[header_end..].find("```") {
+            Some(offset) => header_end + offset,
+            None => {
+                cleaned.push_str(&content[start..]);
+                cursor = content.len();
+                break;
+            }
+        };
+
+        let block = &content[header_end..body_end];
+        if let Some(mut parsed) = parse_a2ui_messages_block(block) {
+            messages.append(&mut parsed);
+        } else {
+            cleaned.push_str(&content[start..(body_end + 3)]);
+        }
+
+        cursor = body_end + 3;
+    }
+
+    if cursor < content.len() {
+        cleaned.push_str(&content[cursor..]);
+    }
+
+    (cleaned.trim().to_string(), messages)
+}
+
+async fn emit_a2ui_messages(
+    bus: &Arc<MessageBus>,
+    channel: &str,
+    chat_id: &str,
+    messages: &[serde_json::Value],
+) {
+    for message in messages {
+        publish_custom_ui_event(
+            bus,
+            Some(channel),
+            Some(chat_id),
+            agui_events::A2UI,
+            message,
+            Some("[a2ui] update"),
+        )
+        .await;
+    }
+}
+
 fn build_thinking_detail(response: &LLMResponse) -> Option<String> {
     let content = response.content.trim();
     if content.is_empty() {
@@ -3706,7 +3823,16 @@ impl AgentLoop {
                     "Request completed"
                 );
 
-                let mut outbound = OutboundMessage::new(&msg.channel, &msg.chat_id, &response);
+                let (response_text, a2ui_messages) = if supports_custom_ui_channel(&msg.channel) {
+                    extract_a2ui_messages_from_response(&response)
+                } else {
+                    (response.clone(), Vec::new())
+                };
+                if !a2ui_messages.is_empty() {
+                    emit_a2ui_messages(&self.bus, &msg.channel, &msg.chat_id, &a2ui_messages).await;
+                }
+
+                let mut outbound = OutboundMessage::new(&msg.channel, &msg.chat_id, &response_text);
                 propagate_routing_metadata(&mut outbound, msg);
                 if let Err(e) = self.bus.publish_outbound(outbound).await {
                     error!("Failed to publish outbound message: {}", e);
@@ -3839,6 +3965,15 @@ impl AgentLoop {
                 let latency_ms = start.elapsed().as_millis() as u64;
                 let (input_tokens, output_tokens) =
                     Self::token_delta(usage_metrics.as_ref(), tokens_before);
+                let (cleaned_final_content, a2ui_messages) = if supports_custom_ui_channel(&msg.channel)
+                {
+                    extract_a2ui_messages_from_response(&final_content)
+                } else {
+                    (final_content.clone(), Vec::new())
+                };
+                if !a2ui_messages.is_empty() {
+                    emit_a2ui_messages(&self.bus, &msg.channel, &msg.chat_id, &a2ui_messages).await;
+                }
 
                 info!(
                     latency_ms = latency_ms,
@@ -3857,7 +3992,8 @@ impl AgentLoop {
                         error!("Failed to publish chunk-end: {}", e);
                     }
                 } else {
-                    let mut full = OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
+                    let mut full =
+                        OutboundMessage::new(&msg.channel, &msg.chat_id, &cleaned_final_content);
                     propagate_routing_metadata(&mut full, msg);
                     if let Err(e) = self.bus.publish_outbound(full).await {
                         error!("Failed to publish full reply: {}", e);
@@ -4298,6 +4434,45 @@ mod tests {
             build_thinking_detail(&response).is_none(),
             "tool-only response should not be shown as thought detail"
         );
+    }
+
+    #[test]
+    fn test_extract_a2ui_messages_from_response_strips_valid_blocks() {
+        let raw = r#"
+before
+```a2ui
+{"version":"v0.9","createSurface":{"surfaceId":"main","catalogId":"basic"}}
+```
+after
+"#;
+        let (cleaned, messages) = extract_a2ui_messages_from_response(raw);
+        assert_eq!(messages.len(), 1);
+        assert!(cleaned.contains("before"));
+        assert!(cleaned.contains("after"));
+        assert!(!cleaned.contains("```a2ui"));
+    }
+
+    #[test]
+    fn test_extract_a2ui_messages_from_response_keeps_invalid_blocks() {
+        let raw = r#"
+```a2ui
+not-json
+```
+"#;
+        let (cleaned, messages) = extract_a2ui_messages_from_response(raw);
+        assert!(messages.is_empty());
+        assert!(cleaned.contains("```a2ui"));
+    }
+
+    #[test]
+    fn test_extract_a2ui_messages_from_response_supports_messages_wrapper() {
+        let raw = r#"
+```a2ui
+{"messages":[{"version":"v0.9","createSurface":{"surfaceId":"s","catalogId":"basic"}},{"version":"v0.9","deleteSurface":{"surfaceId":"s"}}]}
+```
+"#;
+        let (_cleaned, messages) = extract_a2ui_messages_from_response(raw);
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]

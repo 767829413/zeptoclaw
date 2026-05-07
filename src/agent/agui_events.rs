@@ -7,6 +7,7 @@ pub const THINKING_STATUS: &str = "ui:thinking_status";
 pub const TOOL_CALL: &str = "ui:tool_call";
 pub const APPROVAL_REQUEST: &str = "ui:approval_request";
 pub const APPROVAL_RESOLVED: &str = "ui:approval_resolved";
+pub const A2UI: &str = "ui:a2ui";
 
 #[cfg(test)]
 mod tests {
@@ -20,6 +21,7 @@ mod tests {
             TOOL_CALL,
             APPROVAL_REQUEST,
             APPROVAL_RESOLVED,
+            A2UI,
         ] {
             assert!(
                 name.starts_with("ui:"),

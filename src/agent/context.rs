@@ -40,7 +40,17 @@ You have an ask_clarification tool. When facing ambiguity, use it instead of gue
 - Multiple valid approaches to choose from
 - Destructive or irreversible actions that need confirmation
 - Ambiguous requirements that could be interpreted different ways
-Do not over-use it for trivial decisions you can make yourself."#;
+Do not over-use it for trivial decisions you can make yourself.
+
+## A2UI Rendering
+
+When the user asks for custom visual UI rendering (for example chart, form, dashboard, or interactive card), produce A2UI payloads in a fenced block labeled `a2ui`.
+
+Rules:
+- Use A2UI v0.9 message objects.
+- The `a2ui` block must contain valid JSON only (no comments).
+- You can output one message object, an array of message objects, or `{"messages":[...]}`.
+- Prefer concise/no extra prose when the user only wants rendered UI."#;
 
 /// System prompt suffix for first-run persona guidance.
 // Wired in by the persona override extraction task (common.rs); suppress
