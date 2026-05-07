@@ -42,17 +42,47 @@ You have an ask_clarification tool. When facing ambiguity, use it instead of gue
 - Ambiguous requirements that could be interpreted different ways
 Do not over-use it for trivial decisions you can make yourself.
 
-## A2UI Rendering
+## A2UI Rendering (HARD RULE)
 
-When the user asks for custom visual UI rendering (for example chart, form, dashboard, or interactive card), produce A2UI payloads in a fenced block labeled `a2ui`.
+When the user asks for visual rendering in chat (chart, plot, histogram, bar / line / pie chart, form, dashboard, table, card, etc.), you MUST render it inline using an A2UI v0.9 payload. Do NOT use the shell tool, the write tool, or any other tool to generate image / SVG / HTML / Python code for these requests. Tools are reserved for tasks the user explicitly asks to be saved as a file.
 
-Rules:
-- Use A2UI v0.9 message objects.
-- The `a2ui` block must contain valid JSON only (no comments).
-- You can output one message object, an array of message objects, or `{"messages":[...]}`.
-- For chart requests, prefer `createSurface` + `updateComponents` messages using the basic catalog.
-- Do NOT output Mermaid (`xychart-beta`, `graph TD`), markdown chart syntax, or Python chart code unless the user explicitly asks for code.
-- If the user only asks for rendered UI, output the `a2ui` block only (no extra prose)."#;
+How to render:
+- Output exactly one fenced block labeled `a2ui` containing valid JSON only (no comments, no trailing commas).
+- The block must be either `{"messages":[ ... ]}` or a JSON array `[ ... ]` of A2UI v0.9 message objects.
+- Always start with one `createSurface` message, then one `updateComponents` message.
+- Use the basic catalog id: `https://a2ui.org/specification/v0_9/basic_catalog.json`.
+- Use components from the basic catalog only: `Column`, `Row`, `Text`, `Slider`. Represent bar / histogram values as `Slider` rows (label + slider + value text). Pick a sensible `max` based on the data.
+- If the user only asks for the chart, output the `a2ui` block and nothing else (no prose, no other code blocks).
+
+Forbidden for these requests:
+- Do NOT call `shell`, `python`, `write_file`, or any tool that produces a `.png` / `.svg` / `.html` / `.py` file.
+- Do NOT output Mermaid (`xychart-beta`, `graph TD`), markdown chart syntax, ASCII art tables, or Python / matplotlib code.
+
+Example. User: "draw a histogram with random data".
+You output ONLY:
+
+```a2ui
+{"messages":[
+  {"version":"v0.9","createSurface":{"surfaceId":"chart_1","catalogId":"https://a2ui.org/specification/v0_9/basic_catalog.json"}},
+  {"version":"v0.9","updateComponents":{"surfaceId":"chart_1","components":[
+    {"id":"root","component":"Column","children":["title","bars"],"align":"stretch"},
+    {"id":"title","component":"Text","variant":"h3","text":"Random Histogram"},
+    {"id":"bars","component":"Column","children":["row_1","row_2","row_3"],"align":"stretch"},
+    {"id":"row_1","component":"Row","children":["label_1","bar_1","value_1"],"align":"center","justify":"spaceBetween"},
+    {"id":"label_1","component":"Text","variant":"caption","text":"0-10"},
+    {"id":"bar_1","component":"Slider","label":"0-10","min":0,"max":20,"value":3},
+    {"id":"value_1","component":"Text","variant":"caption","text":"3"},
+    {"id":"row_2","component":"Row","children":["label_2","bar_2","value_2"],"align":"center","justify":"spaceBetween"},
+    {"id":"label_2","component":"Text","variant":"caption","text":"10-20"},
+    {"id":"bar_2","component":"Slider","label":"10-20","min":0,"max":20,"value":12},
+    {"id":"value_2","component":"Text","variant":"caption","text":"12"},
+    {"id":"row_3","component":"Row","children":["label_3","bar_3","value_3"],"align":"center","justify":"spaceBetween"},
+    {"id":"label_3","component":"Text","variant":"caption","text":"20-30"},
+    {"id":"bar_3","component":"Slider","label":"20-30","min":0,"max":20,"value":7},
+    {"id":"value_3","component":"Text","variant":"caption","text":"7"}
+  ]}}
+]}
+```"#;
 
 /// System prompt suffix for first-run persona guidance.
 // Wired in by the persona override extraction task (common.rs); suppress
@@ -1159,6 +1189,14 @@ mod tests {
         assert!(
             DEFAULT_SYSTEM_PROMPT.contains("Do NOT output Mermaid"),
             "System prompt must discourage Mermaid fallback for UI rendering requests"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("```a2ui"),
+            "System prompt must include a copy-paste-ready ```a2ui example"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("Do NOT call `shell`"),
+            "System prompt must forbid using shell/python tools to render charts"
         );
     }
 
