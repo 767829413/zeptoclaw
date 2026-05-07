@@ -746,6 +746,16 @@ fn extract_a2ui_messages_from_response(content: &str) -> (String, Vec<serde_json
             cleaned = strip_mermaid_xychart_block(&cleaned);
         }
     }
+    info!(
+        target: "zeptoclaw::agent::a2ui",
+        input_len = content.len(),
+        cleaned_len = cleaned.len(),
+        has_a2ui_fence = content.contains("```a2ui"),
+        has_xychart = content.contains("xychart-beta"),
+        messages = messages.len(),
+        head = %truncate_utf8(content, 240),
+        "extract_a2ui_messages_from_response decision"
+    );
     (cleaned, messages)
 }
 
