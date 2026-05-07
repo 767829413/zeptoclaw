@@ -639,7 +639,6 @@ fn build_a2ui_messages_from_mermaid_xychart(spec: &MermaidXyChartSpec) -> Vec<se
 
     for (idx, (label, value)) in spec.labels.iter().zip(spec.values.iter()).enumerate() {
         let row_id = format!("row_{}", idx + 1);
-        let label_id = format!("label_{}", idx + 1);
         let slider_id = format!("bar_{}", idx + 1);
         let value_id = format!("value_{}", idx + 1);
         row_ids.push(row_id.clone());
@@ -647,15 +646,9 @@ fn build_a2ui_messages_from_mermaid_xychart(spec: &MermaidXyChartSpec) -> Vec<se
         components.push(serde_json::json!({
             "id": row_id,
             "component": "Row",
-            "children": [label_id, slider_id, value_id],
+            "children": [slider_id, value_id],
             "align": "center",
             "justify": "spaceBetween",
-        }));
-        components.push(serde_json::json!({
-            "id": label_id,
-            "component": "Text",
-            "variant": "caption",
-            "text": label,
         }));
         components.push(serde_json::json!({
             "id": slider_id,
@@ -746,16 +739,6 @@ fn extract_a2ui_messages_from_response(content: &str) -> (String, Vec<serde_json
             cleaned = strip_mermaid_xychart_block(&cleaned);
         }
     }
-    info!(
-        target: "zeptoclaw::agent::a2ui",
-        input_len = content.len(),
-        cleaned_len = cleaned.len(),
-        has_a2ui_fence = content.contains("```a2ui"),
-        has_xychart = content.contains("xychart-beta"),
-        messages = messages.len(),
-        head = %truncate_utf8(content, 240),
-        "extract_a2ui_messages_from_response decision"
-    );
     (cleaned, messages)
 }
 
@@ -779,6 +762,9 @@ async fn emit_a2ui_messages(
 }
 
 fn build_thinking_detail(response: &LLMResponse) -> Option<String> {
+    if !response.has_tool_calls() {
+        return None;
+    }
     let content = response.content.trim();
     if content.is_empty() {
         return None;
@@ -4647,15 +4633,31 @@ mod tests {
     }
 
     #[test]
-    fn test_build_thinking_detail_includes_model_draft() {
-        let response = LLMResponse::text("draft answer");
-        let detail = build_thinking_detail(&response).expect("detail expected");
-        assert!(detail.contains("Model draft:"));
-        assert!(detail.contains("draft answer"));
+    fn test_build_thinking_detail_final_answer_returns_none() {
+        let response = LLMResponse::text("final answer to the user");
+        assert!(
+            build_thinking_detail(&response).is_none(),
+            "final answer (no tool calls) is the reply, not a thought"
+        );
     }
 
     #[test]
-    fn test_build_thinking_detail_without_model_draft_returns_none() {
+    fn test_build_thinking_detail_intermediate_with_content() {
+        let response = LLMResponse::with_tools(
+            "let me check the file first",
+            vec![LLMToolCall::new(
+                "call_1",
+                "read_file",
+                r#"{"path":"a.txt"}"#,
+            )],
+        );
+        let detail = build_thinking_detail(&response).expect("detail expected");
+        assert!(detail.contains("Model draft:"));
+        assert!(detail.contains("let me check the file first"));
+    }
+
+    #[test]
+    fn test_build_thinking_detail_tool_only_returns_none() {
         let response = LLMResponse::with_tools(
             "",
             vec![LLMToolCall::new(
