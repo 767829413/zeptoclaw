@@ -324,13 +324,20 @@ pub(crate) async fn cmd_gateway(
                     else {
                         return false;
                     };
-                    if !request_id.is_empty() && !broker.has_pending(&msg.chat_id) {
-                        return false;
-                    }
+                    // "yes all" / "no all" is an explicit batch decision and
+                    // doesn't carry a per-request semantic — drain everything.
                     if all {
-                        broker.resolve_all(&msg.chat_id, approved) > 0
-                    } else {
+                        return broker.resolve_all(&msg.chat_id, approved) > 0;
+                    }
+                    // Single-decision path: an empty request_id means the
+                    // caller couldn't provide one (defensive — AG-UI always
+                    // supplies it). Fall back to FIFO so the path still works
+                    // for any legacy caller, but the clean path resolves the
+                    // exact entry by id so multi-pending can't cross-talk.
+                    if request_id.is_empty() {
                         broker.resolve(&msg.chat_id, approved)
+                    } else {
+                        broker.resolve_by_id(&msg.chat_id, request_id, approved)
                     }
                 }
                 Some(_) => false,
@@ -748,7 +755,7 @@ async fn register_approval_handler(
                 };
 
                 let request_id = ulid::Ulid::new().to_string();
-                let rx = broker.register(&chat_id);
+                let rx = broker.register(&chat_id, &request_id);
 
                 // Format the approval prompt. Shell commands get a clean code-block
                 // display; other tools show pretty-printed JSON arguments.
