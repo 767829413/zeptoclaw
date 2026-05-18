@@ -864,29 +864,76 @@ fn is_trusted_local_session(msg: &InboundMessage) -> bool {
 async fn resolve_tool_approval(
     gate: &ApprovalGate,
     approval_handler: Option<&ApprovalHandler>,
+    thread_identity: &crate::tools::thread_identity::ThreadIdentity,
     tool_name: &str,
     args: &serde_json::Value,
     channel: Option<&str>,
     chat_id: Option<&str>,
 ) -> Option<String> {
-    if !gate.requires_approval(tool_name) {
+    // PR3: HardFloor takes precedence over the regular ApprovalGate.
+    // A HardFloor hit forces interactive approval even when the gate
+    // would normally let the call through (e.g. policy = AlwaysAllow,
+    // or thread mode = AutoApprove — that branch is enforced in the
+    // gateway handler, which sees `hard_floor_reason.is_some()` and
+    // skips its AutoApprove bypass).
+    //
+    // The matcher is `Copy + cheap`; we instantiate one per call rather
+    // than holding it on the agent because it's stateless and shaves
+    // a constructor argument off `resolve_tool_approval`.
+    let hard_floor =
+        crate::tools::hard_floor::HardFloorMatcher::default().check(tool_name, args);
+
+    if hard_floor.is_none() && !gate.requires_approval(tool_name) {
         return None;
     }
 
     if let Some(handler) = approval_handler {
-        let request = gate
+        // Stamp the request with the process-level `(user_id, agent_id)`
+        // pair so the broker can key its pending entry on something
+        // stable across ACP session churn. `Unknown` leaves both fields
+        // None and the handler falls back to `chat_id`-keyed routing —
+        // identical to pre-PR1 behaviour.
+        let (user_id, agent_id) = match thread_identity.as_known() {
+            Some(k) => (Some(k.user.as_str()), Some(k.agent.as_str())),
+            None => (None, None),
+        };
+        let mut request = gate
             .create_request(tool_name, args)
-            .with_routing(channel, chat_id);
+            .with_routing(channel, chat_id)
+            .with_thread(user_id, agent_id);
+        if let Some(rule) = hard_floor {
+            request = request.with_hard_floor(rule.reason);
+        }
         match handler(request).await {
             ApprovalResponse::Approved => None,
             ApprovalResponse::Denied(reason) => Some(format!(
                 "Tool '{}' was denied by user approval. {}",
                 tool_name, reason
             )),
-            ApprovalResponse::TimedOut => Some(format!(
-                "Tool '{}' approval timed out and was not executed.",
-                tool_name
-            )),
+            ApprovalResponse::TimedOut => {
+                // PR3: HardFloor entries collapse TimedOut → Denied so
+                // the LLM can't retry into a silent execution. The
+                // regular path keeps surfacing TimedOut so it stays
+                // distinguishable from an explicit user no.
+                if let Some(rule) = hard_floor {
+                    tracing::warn!(
+                        target: "audit::approval",
+                        tool = %tool_name,
+                        rule = %rule.id,
+                        decision = "denied_on_hard_floor_timeout",
+                        "HardFloor approval timed out — forced Denied"
+                    );
+                    Some(format!(
+                        "Tool '{}' was denied: HardFloor approval ({}) timed out.",
+                        tool_name, rule.id
+                    ))
+                } else {
+                    Some(format!(
+                        "Tool '{}' approval timed out and was not executed.",
+                        tool_name
+                    ))
+                }
+            }
         }
     } else {
         let prompt = gate.format_approval_request(tool_name, args);
@@ -1353,6 +1400,13 @@ pub struct AgentLoop {
     approval_gate: Arc<ApprovalGate>,
     /// Optional handler used by interactive frontends to resolve approval prompts inline.
     approval_handler: Arc<RwLock<Option<ApprovalHandler>>>,
+    /// Process-level `(user, agent)` identity used by the approval broker
+    /// to anchor pending entries on a key that survives ACP session churn.
+    /// Set once at gateway startup via [`Self::set_thread_identity`]; reads
+    /// fall back to `Unknown` (legacy `chat_id`-keyed behaviour) until
+    /// then. `OnceLock` keeps the setter `&self`-only so callers don't
+    /// need exclusive ownership of the `Arc<AgentLoop>`.
+    thread_identity: std::sync::OnceLock<Arc<crate::tools::thread_identity::ThreadIdentity>>,
     /// Agent mode for category-based tool enforcement.
     agent_mode: crate::security::AgentMode,
     /// Optional safety layer for tool output sanitization.
@@ -1466,6 +1520,7 @@ impl AgentLoop {
             tool_call_limit,
             approval_gate,
             approval_handler: Arc::new(RwLock::new(None)),
+            thread_identity: std::sync::OnceLock::new(),
             agent_mode,
             safety_layer,
             context_monitor,
@@ -1531,6 +1586,7 @@ impl AgentLoop {
             tool_call_limit,
             approval_gate,
             approval_handler: Arc::new(RwLock::new(None)),
+            thread_identity: std::sync::OnceLock::new(),
             agent_mode,
             safety_layer,
             context_monitor,
@@ -1702,6 +1758,28 @@ impl AgentLoop {
         let wrapped: ApprovalHandler = Arc::new(move |request| handler(request).boxed());
         let mut slot = self.approval_handler.write().await;
         *slot = Some(wrapped);
+    }
+
+    /// Install the process-level `ThreadIdentity` used to key the approval
+    /// broker. Idempotent for the first call; subsequent calls are
+    /// silently ignored (the sandbox is per-`(user, agent)` by
+    /// construction — the identity never changes after startup).
+    pub fn set_thread_identity(
+        &self,
+        identity: Arc<crate::tools::thread_identity::ThreadIdentity>,
+    ) {
+        let _ = self.thread_identity.set(identity);
+    }
+
+    /// Resolve the current `ThreadIdentity`. Returns the installed value
+    /// or `Unknown` when `set_thread_identity` was never called (dev /
+    /// in-process callers, unit tests).
+    pub fn thread_identity(&self) -> Arc<crate::tools::thread_identity::ThreadIdentity> {
+        use crate::tools::thread_identity::ThreadIdentity;
+        self.thread_identity
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(ThreadIdentity::Unknown))
     }
 
     /// Merge all tools from a kernel ToolRegistry and register MCP clients.
@@ -2210,6 +2288,7 @@ impl AgentLoop {
                     let metrics_collector = Arc::clone(&metrics_collector);
                     let gate = Arc::clone(&approval_gate);
                     let approval_handler = approval_handler.clone();
+                    let thread_identity = self.thread_identity();
                     let hooks = Arc::clone(&hook_engine);
                     let safety = safety_layer.clone();
                     let taint = taint_engine.clone();
@@ -2281,6 +2360,7 @@ impl AgentLoop {
                             if let Some(message) = resolve_tool_approval(
                                 &gate,
                                 approval_handler.as_ref(),
+                                thread_identity.as_ref(),
                                 &name,
                                 &args,
                                 ctx.channel.as_deref(),
@@ -3186,6 +3266,7 @@ impl AgentLoop {
                     let metrics_collector = Arc::clone(&metrics_collector);
                     let gate = Arc::clone(&approval_gate);
                     let approval_handler = approval_handler.clone();
+                    let thread_identity = self.thread_identity();
                     let hooks = Arc::clone(&hook_engine);
                     let safety = safety_layer_stream.clone();
                     let taint = taint_engine_stream.clone();
@@ -3250,6 +3331,7 @@ impl AgentLoop {
                             if let Some(message) = resolve_tool_approval(
                                 &gate,
                                 approval_handler.as_ref(),
+                                thread_identity.as_ref(),
                                 &name,
                                 &args,
                                 ctx.channel.as_deref(),
@@ -3673,12 +3755,20 @@ impl AgentLoop {
                 .build_resolved_messages(msg, &session, memory_override.as_deref())
                 .await;
 
-            let tool_definitions = if tool_limit_hit {
-                vec![]
-            } else {
-                let tools = self.tools.read().await;
-                tools.definitions_with_options(self.config.agents.defaults.compact_tools)
-            };
+            // Final streaming call: tools are intentionally omitted. By
+            // contract the tool loop above has already exhausted every
+            // tool decision the model wanted to make, so this call is
+            // supposed to emit the user-visible answer only. Leaving
+            // tools in the catalog tempts providers (OpenAI, DeepSeek,
+            // Claude) to emit StreamEvent::ToolCalls mid-stream — a
+            // legitimate model behaviour we then mis-handled as a hard
+            // failure (`Provider error: unexpected tool calls in final
+            // streaming call`). Force the empty catalog so that path is
+            // structurally unreachable. `tool_limit_hit` is left in
+            // scope for future logging hooks; behavioural parity with
+            // the prior tool-limit branch is preserved.
+            let tool_definitions: Vec<crate::providers::ToolDefinition> = Vec::new();
+            let _ = tool_limit_hit;
 
             // Signal that tools are done and response is ready (streaming path)
             if let Some(tx) = self.tool_feedback_tx.read().await.as_ref() {
@@ -4172,17 +4262,31 @@ impl AgentLoop {
                         final_content = resolve_streamed_response_text(&streamed_content, &content);
                         break;
                     }
-                    StreamEvent::ToolCalls(_) => {
-                        // Streaming path is the FINAL call; tool calls
-                        // here are a provider contract violation. Surface
-                        // as an error so the outer arm marks it on the
-                        // OutboundMessage (mark_error) — silently breaking
-                        // would emit a normal ChunkEnd and be read as a
-                        // successful end_turn by the client.
-                        warn!("Unexpected ToolCalls mid-stream; failing turn");
-                        return Err(ZeptoError::Provider(
-                            "unexpected tool calls in final streaming call".to_string(),
-                        ));
+                    StreamEvent::ToolCalls(tool_calls) => {
+                        // Defence-in-depth: the final streaming call no
+                        // longer advertises any tool catalog (see the
+                        // `tool_definitions = Vec::new()` site in
+                        // `process_message_streaming`), so providers
+                        // should not emit `ToolCalls` here. A handful of
+                        // providers still echo tool_calls from older
+                        // turns even with no tools advertised; previously
+                        // we hard-failed the turn (`Provider error:
+                        // unexpected tool calls in final streaming call`),
+                        // which the gateway / channel layer surfaced to
+                        // the user as "Failed to process message" and
+                        // poisoned subsequent retries on the cached ACP
+                        // session. Treat it as the end of the turn
+                        // instead: log loudly, drop the bogus tool_calls,
+                        // and complete with whatever text has already
+                        // been streamed.
+                        warn!(
+                            tool_calls = ?tool_calls,
+                            streamed_bytes = streamed_content.len(),
+                            "ignoring unexpected ToolCalls on final streaming call; \
+                             treating turn as complete with streamed content"
+                        );
+                        final_content = streamed_content.clone();
+                        break;
                     }
                     StreamEvent::Error(e) => return Err(e),
                 }
@@ -6426,5 +6530,236 @@ tail line
             }
             _ => panic!("expected ToolDone"),
         }
+    }
+
+    // ---- PR3: HardFloor escalation in resolve_tool_approval ------------
+
+    /// Gate that never asks for approval. Lets us prove HardFloor
+    /// escalates **regardless** of the regular gate's policy.
+    fn allow_all_gate() -> ApprovalGate {
+        ApprovalGate::new(crate::tools::approval::ApprovalConfig {
+            enabled: true,
+            policy: crate::tools::approval::ApprovalPolicyConfig::AlwaysAllow,
+            ..Default::default()
+        })
+    }
+
+    fn unknown_identity() -> crate::tools::thread_identity::ThreadIdentity {
+        crate::tools::thread_identity::ThreadIdentity::Unknown
+    }
+
+    fn shell_args(cmd: &str) -> serde_json::Value {
+        serde_json::json!({ "command": cmd })
+    }
+
+    fn capture_handler(
+        seen: std::sync::Arc<std::sync::Mutex<Option<ApprovalRequest>>>,
+        response: ApprovalResponse,
+    ) -> ApprovalHandler {
+        std::sync::Arc::new(move |req: ApprovalRequest| {
+            let seen = std::sync::Arc::clone(&seen);
+            let response = response.clone();
+            async move {
+                *seen.lock().expect("seen poisoned") = Some(req);
+                response
+            }
+            .boxed()
+        })
+    }
+
+    #[tokio::test]
+    async fn hard_floor_forces_approval_even_when_gate_allows() {
+        let gate = allow_all_gate();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handler = capture_handler(
+            std::sync::Arc::clone(&seen),
+            ApprovalResponse::Approved,
+        );
+        let identity = unknown_identity();
+
+        // `rm -rf /` matches `rm_rf_root` → handler must be invoked
+        // even though the gate is AlwaysAllow.
+        let result = resolve_tool_approval(
+            &gate,
+            Some(&handler),
+            &identity,
+            "shell",
+            &shell_args("rm -rf /"),
+            Some("discord"),
+            Some("chat1"),
+        )
+        .await;
+
+        // User approved → message is None, tool would execute.
+        assert!(result.is_none());
+        let req = seen.lock().unwrap().take().expect("handler must be called");
+        assert_eq!(req.tool_name, "shell");
+        assert!(
+            req.hard_floor_reason.is_some(),
+            "ApprovalRequest must carry the HardFloor reason"
+        );
+        assert!(req
+            .hard_floor_reason
+            .as_deref()
+            .unwrap()
+            .to_lowercase()
+            .contains("filesystem"));
+    }
+
+    #[tokio::test]
+    async fn hard_floor_does_not_fire_for_safe_command() {
+        // A benign shell command under AlwaysAllow gate: no HardFloor,
+        // no regular approval, handler never invoked, fn returns None.
+        let gate = allow_all_gate();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handler = capture_handler(
+            std::sync::Arc::clone(&seen),
+            ApprovalResponse::Approved,
+        );
+
+        let result = resolve_tool_approval(
+            &gate,
+            Some(&handler),
+            &unknown_identity(),
+            "shell",
+            &shell_args("ls -la /tmp"),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "handler must NOT be called for non-HardFloor + AlwaysAllow"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_floor_timeout_collapses_to_denied() {
+        // The whole point of HardFloor: if the user walks away mid
+        // approval, the LLM gets a hard Denied, not TimedOut (which
+        // it might retry into a silent execution).
+        let gate = allow_all_gate();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handler = capture_handler(
+            std::sync::Arc::clone(&seen),
+            ApprovalResponse::TimedOut,
+        );
+
+        let result = resolve_tool_approval(
+            &gate,
+            Some(&handler),
+            &unknown_identity(),
+            "shell",
+            &shell_args("mkfs.ext4 /dev/sdb1"),
+            None,
+            None,
+        )
+        .await
+        .expect("HardFloor TimedOut should produce a message");
+
+        // Must be a Denied-style message, NOT a TimedOut message.
+        let lower = result.to_lowercase();
+        assert!(
+            lower.contains("denied") || lower.contains("hard floor") || lower.contains("hardfloor"),
+            "HardFloor TimedOut should surface as a denial, got: {}",
+            result
+        );
+        assert!(
+            !lower.contains("approval timed out and was not executed"),
+            "TimedOut path must not be reached for HardFloor: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn non_hard_floor_timeout_stays_timed_out() {
+        // Regression: regular tools that hit the gate (dangerous-tools)
+        // still surface TimedOut so the LLM can distinguish "user
+        // walked away" from "user said no".
+        let gate = ApprovalGate::new(crate::tools::approval::ApprovalConfig {
+            enabled: true,
+            policy: crate::tools::approval::ApprovalPolicyConfig::AlwaysRequire,
+            ..Default::default()
+        });
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handler = capture_handler(
+            std::sync::Arc::clone(&seen),
+            ApprovalResponse::TimedOut,
+        );
+
+        let result = resolve_tool_approval(
+            &gate,
+            Some(&handler),
+            &unknown_identity(),
+            "shell",
+            &shell_args("echo hello"),
+            None,
+            None,
+        )
+        .await
+        .expect("AlwaysRequire+TimedOut should produce a message");
+
+        assert!(
+            result.contains("timed out"),
+            "non-HardFloor TimedOut must keep its timed-out message, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_floor_denied_propagates_user_reason() {
+        // User explicitly says no — message must include the user
+        // reason (existing contract).
+        let gate = allow_all_gate();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handler = capture_handler(
+            std::sync::Arc::clone(&seen),
+            ApprovalResponse::Denied("nope".into()),
+        );
+
+        let result = resolve_tool_approval(
+            &gate,
+            Some(&handler),
+            &unknown_identity(),
+            "shell",
+            &shell_args("rm -rf /"),
+            None,
+            None,
+        )
+        .await
+        .expect("denied → message");
+        assert!(result.contains("denied"), "{}", result);
+        assert!(result.contains("nope"), "{}", result);
+    }
+
+    #[tokio::test]
+    async fn non_shell_tool_skips_hard_floor() {
+        // PR3 ruleset only inspects `shell`. A `write_file` argument
+        // with a destructive-looking path must NOT escalate to
+        // HardFloor — it goes through whatever the regular gate says.
+        let gate = allow_all_gate();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handler = capture_handler(
+            std::sync::Arc::clone(&seen),
+            ApprovalResponse::Approved,
+        );
+
+        let result = resolve_tool_approval(
+            &gate,
+            Some(&handler),
+            &unknown_identity(),
+            "write_file",
+            &serde_json::json!({"path": "/", "content": "rm -rf /"}),
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "non-shell tools must skip HardFloor and fall back to the gate"
+        );
     }
 }

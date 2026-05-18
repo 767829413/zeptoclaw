@@ -62,6 +62,11 @@ const MAX_ACP_SESSIONS: usize = 1_000;
 const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 /// How long (seconds) to wait for the agent to reply to session/prompt.
 const PROMPT_TIMEOUT_SECS: u64 = 300;
+/// Interval between SSE comment heartbeats while a prompt is in flight.
+/// Must be short enough that no upstream (reqwest, docker-proxy, OS TCP
+/// keepalive defaults) decides the stream is dead. 5s is well under the
+/// observed ~7s "SSE ended without a response frame" failure window.
+const SSE_HEARTBEAT_SECS: u64 = 5;
 
 // --- HTTP response helpers ---
 
@@ -815,26 +820,38 @@ impl AcpHttpChannel {
         let _ = stream.flush().await;
 
         // Consume fragments until a terminal variant is seen, the senders
-        // are dropped, or PROMPT_TIMEOUT_SECS elapses between fragments.
-        // Timeout gates each `recv()` individually so token streams with
-        // long provider-side stalls are still bounded.
-        let timeout_dur = Duration::from_secs(PROMPT_TIMEOUT_SECS);
+        // are dropped, or the absolute prompt deadline expires. We
+        // intentionally interleave an SSE comment "heartbeat" every
+        // SSE_HEARTBEAT_SECS so a long stall (e.g. agent blocked waiting
+        // on a user approval delivered through a different channel)
+        // doesn't leave the HTTP/1.1 stream idle. Without it, the
+        // scheduler's reqwest client / docker-proxy can decide the
+        // stream has ended without a final response frame and bail
+        // ~5–10s into the wait, even though the agent is healthily
+        // blocked on `oneshot::recv()`. SSE comment lines (`: …\n\n`)
+        // are silently skipped by any conforming SSE consumer.
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(PROMPT_TIMEOUT_SECS);
+        let heartbeat = Duration::from_secs(SSE_HEARTBEAT_SECS);
         loop {
-            let frag = match tokio::time::timeout(timeout_dur, rx.recv()).await {
-                Ok(Some(frag)) => frag,
-                Ok(None) => {
-                    // All senders dropped without a terminal frame, e.g.
-                    // channel stop() or abrupt shutdown. Treat as error.
-                    let ev = Self::sse_event(&Self::json_rpc_error(
-                        id.clone(),
-                        -32603,
-                        "agent session closed",
-                    ));
-                    let _ = stream.write_all(ev.as_bytes()).await;
-                    let _ = stream.flush().await;
-                    break;
-                }
-                Err(_) => {
+            let frag = tokio::select! {
+                biased;
+                maybe = rx.recv() => match maybe {
+                    Some(frag) => frag,
+                    None => {
+                        // All senders dropped without a terminal frame,
+                        // e.g. channel stop() or abrupt shutdown.
+                        let ev = Self::sse_event(&Self::json_rpc_error(
+                            id.clone(),
+                            -32603,
+                            "agent session closed",
+                        ));
+                        let _ = stream.write_all(ev.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        break;
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => {
                     let ev = Self::sse_event(&Self::json_rpc_error(
                         id.clone(),
                         -32603,
@@ -843,6 +860,18 @@ impl AcpHttpChannel {
                     let _ = stream.write_all(ev.as_bytes()).await;
                     let _ = stream.flush().await;
                     break;
+                }
+                _ = tokio::time::sleep(heartbeat) => {
+                    // SSE comment: line starting with ':' is ignored by
+                    // any conforming consumer (browsers, reqwest's
+                    // bytes_stream, etc.). All it does is keep the
+                    // underlying TCP stream alive for intermediaries
+                    // that close idle HTTP/1.1 connections.
+                    if stream.write_all(b":ka\n\n").await.is_err() {
+                        break;
+                    }
+                    let _ = stream.flush().await;
+                    continue;
                 }
             };
 

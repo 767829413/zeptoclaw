@@ -21,7 +21,7 @@
 //!     "approval": {
 //!         "enabled": true,
 //!         "policy": "require_for_dangerous",
-//!         "dangerous_tools": ["shell", "write_file", "edit_file", "google"]
+//!         "dangerous_tools": ["shell", "write_file", "edit_file"]
 //!     }
 //! }
 //! ```
@@ -97,7 +97,7 @@ pub enum ApprovalPolicyConfig {
 /// - `enabled`: `true`
 /// - `policy`: `RequireForDangerous`
 /// - `require_for`: empty
-/// - `dangerous_tools`: `["shell", "write_file", "edit_file", "google"]`
+/// - `dangerous_tools`: `["shell", "write_file", "edit_file"]`
 /// - `auto_approve_timeout_secs`: `0` (disabled)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -169,6 +169,23 @@ pub struct ApprovalRequest {
     /// Chat/conversation ID (routing context).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
+    /// Stable user identity for broker routing (PR1+). Filled by the agent
+    /// loop from process-level `ThreadIdentity`. Falls back to `chat_id`
+    /// when absent, preserving pre-PR1 behaviour. `serde(default)` keeps
+    /// older JSON payloads (e.g. from in-flight handlers across an
+    /// upgrade) decodable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Stable agent identity for broker routing (PR1+). Companion to
+    /// `user_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// If `Some`, this approval was triggered by a HardFloor rule and
+    /// cannot be batch-resolved (`yes all` / `no all` must skip it).
+    /// PR1 only carries the field for downstream consumers; PR3 wires
+    /// the enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_floor_reason: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -190,6 +207,9 @@ impl ApprovalRequest {
             auto_approve_at,
             channel: None,
             chat_id: None,
+            user_id: None,
+            agent_id: None,
+            hard_floor_reason: None,
         }
     }
 
@@ -198,6 +218,24 @@ impl ApprovalRequest {
     pub fn with_routing(mut self, channel: Option<&str>, chat_id: Option<&str>) -> Self {
         self.channel = channel.map(|s| s.to_string());
         self.chat_id = chat_id.map(|s| s.to_string());
+        self
+    }
+
+    /// Attach the stable `(user_id, agent_id)` pair the broker uses for
+    /// approval routing. Either side may be `None`; when both are present
+    /// they form a `ThreadKey`, otherwise the broker falls back to
+    /// `chat_id`-keyed routing.
+    pub fn with_thread(mut self, user_id: Option<&str>, agent_id: Option<&str>) -> Self {
+        self.user_id = user_id.map(|s| s.to_string());
+        self.agent_id = agent_id.map(|s| s.to_string());
+        self
+    }
+
+    /// Mark this approval as HardFloor-class with the matching rule's
+    /// human-readable reason. PR1: callers may set this; consumers (broker
+    /// batch resolution, UI rendering) wire up in PR3.
+    pub fn with_hard_floor(mut self, reason: impl Into<String>) -> Self {
+        self.hard_floor_reason = Some(reason.into());
         self
     }
 
@@ -350,11 +388,14 @@ impl ApprovalGate {
     /// should require user approval when the `RequireForDangerous` policy
     /// is active.
     pub fn default_dangerous_tools() -> Vec<String> {
+        // PR3: removed `google`. Web search is not destructive — gating
+        // it behind approval added friction without security value, and
+        // the new HardFloor layer covers the truly catastrophic
+        // operations independently of this list.
         vec![
             "shell".to_string(),
             "write_file".to_string(),
             "edit_file".to_string(),
-            "google".to_string(),
         ]
     }
 
@@ -543,10 +584,12 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.policy, ApprovalPolicyConfig::RequireForDangerous);
         assert!(config.require_for.is_empty());
+        // PR3: `google` removed from default dangerous list.
         assert_eq!(
             config.dangerous_tools,
-            vec!["shell", "write_file", "edit_file", "google"]
+            vec!["shell", "write_file", "edit_file"]
         );
+        assert!(!config.dangerous_tools.contains(&"google".to_string()));
         assert_eq!(config.auto_approve_timeout_secs, 0);
     }
 
@@ -736,11 +779,28 @@ mod tests {
     #[test]
     fn test_default_dangerous_tools_list() {
         let defaults = ApprovalGate::default_dangerous_tools();
-        assert_eq!(defaults.len(), 4);
+        // PR3: `google` dropped — web search is non-destructive.
+        assert_eq!(defaults.len(), 3);
         assert!(defaults.contains(&"shell".to_string()));
         assert!(defaults.contains(&"write_file".to_string()));
         assert!(defaults.contains(&"edit_file".to_string()));
-        assert!(defaults.contains(&"google".to_string()));
+        assert!(!defaults.contains(&"google".to_string()));
+    }
+
+    #[test]
+    fn test_default_dangerous_tools_excludes_web_search() {
+        // Regression guard: web search tools must stay out of the
+        // default dangerous list. HardFloor covers the truly fatal
+        // shell operations; ApprovalGate should only flag side-effectful
+        // tools (writes / shell), not read-only ones.
+        let defaults = ApprovalGate::default_dangerous_tools();
+        for non_destructive in ["google", "web_search", "web_fetch", "read_file"] {
+            assert!(
+                !defaults.contains(&non_destructive.to_string()),
+                "`{}` must not be in default dangerous tools",
+                non_destructive
+            );
+        }
     }
 
     #[test]

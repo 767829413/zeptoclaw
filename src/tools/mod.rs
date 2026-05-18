@@ -60,6 +60,9 @@
 pub mod android;
 pub mod approval;
 pub mod approval_broker;
+pub mod hard_floor;
+pub mod thread_approval;
+pub mod thread_identity;
 pub mod binary_plugin;
 pub mod browser;
 pub mod clarification;
